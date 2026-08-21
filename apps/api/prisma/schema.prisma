@@ -1,0 +1,926 @@
+// Teqdeft Delivery OS — data model.
+//
+// The spine of this schema is the traceability chain from blueprint §6.1:
+//   SourceFragment -> Requirement -> Deliverable -> Milestone -> WorkItem
+//                  -> ChecklistItem -> Evidence -> Approval -> Release
+//
+// Two rules shape almost every table here:
+//   1. Approved scope is immutable. ScopeBaseline snapshots requirement text
+//      at approval time, so a later edit to a Requirement row cannot rewrite
+//      what was signed off (§7.3).
+//   2. Nothing consequential happens without an attributable actor. AuditEvent
+//      is append-only and every gate writes to it (§4.1).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/* ------------------------------------------------------------------ */
+/* Identity and access (§4)                                            */
+/* ------------------------------------------------------------------ */
+
+enum Role {
+  FOUNDER
+  DELIVERY_HEAD
+  CTO
+  PROJECT_MANAGER
+  TEAM_MEMBER
+  QA_ENGINEER
+  SALES
+  FINANCE_VIEWER
+  CLIENT_REVIEWER
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         Role
+  jobTitle     String?
+  avatarColor  String?
+  isActive     Boolean  @default(true)
+  /// Hours available for project work on a normal day, before leave and
+  /// meetings are deducted (§12.1).
+  weeklyHours  Decimal  @default(40) @db.Decimal(5, 2)
+  timezone     String   @default("Asia/Kolkata")
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships       ProjectMember[]
+  managedProjects   Project[]        @relation("ProjectManager")
+  technicalProjects Project[]        @relation("TechnicalLead")
+  uploadedSources   Source[]         @relation("SourceUploader")
+  auditEvents       AuditEvent[]
+  approvals         Approval[]
+  requirementEdits  RequirementRevision[]
+  decisions         Decision[]
+  triggeredAiRuns   AiRun[]
+  assignedWorkItems WorkItem[]       @relation("WorkItemAssignee")
+  ownedRisks        Risk[]           @relation("RiskOwner")
+
+  @@index([role, isActive])
+}
+
+model Client {
+  id                 String              @id @default(uuid())
+  name               String
+  contactName        String?
+  contactEmail       String?
+  communicationNotes String?
+  confidentiality    Confidentiality     @default(STANDARD)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  projects Project[]
+
+  @@unique([name])
+}
+
+/* ------------------------------------------------------------------ */
+/* Projects (§5, §7.1)                                                 */
+/* ------------------------------------------------------------------ */
+
+enum EngagementType {
+  MARKETING_WEBSITE
+  ECOMMERCE
+  CUSTOM_PORTAL
+  WORDPRESS_SUPPORT
+  SEO_CRO_RETAINER
+  DESIGN_ONLY
+}
+
+enum ProjectStage {
+  DELIVERY_INTAKE
+  AI_ANALYSIS
+  HUMAN_CLARIFICATION
+  SCOPE_BASELINE
+  DELIVERY_PLANNING
+  RESOURCE_COMMITMENT
+  EXECUTION
+  QA_AND_ACCEPTANCE
+  LAUNCH_AND_HYPERCARE
+  CLOSURE_AND_LEARNING
+}
+
+enum HealthState {
+  GREEN
+  AMBER
+  RED
+  GREY
+}
+
+enum Confidentiality {
+  STANDARD
+  CONFIDENTIAL
+  RESTRICTED
+}
+
+model Project {
+  id               String          @id @default(uuid())
+  code             String          @unique
+  name             String
+  summary          String?
+  clientId         String
+  engagementType   EngagementType
+  stage            ProjectStage    @default(DELIVERY_INTAKE)
+  /// Never written by hand — recomputed from the rules in §13.1 and always
+  /// accompanied by healthFacts explaining the value.
+  health           HealthState     @default(GREY)
+  healthFacts      Json            @default("[]")
+  healthComputedAt DateTime?
+  confidentiality  Confidentiality @default(STANDARD)
+
+  projectManagerId String
+  technicalLeadId  String?
+
+  startDate        DateTime?
+  targetLaunchDate DateTime?
+  contractValue    Decimal?        @db.Decimal(14, 2)
+  currency         String          @default("INR")
+
+  /// §16.1 — a project can be barred from external AI processing entirely.
+  externalAiEnabled Boolean @default(true)
+
+  intakeChecklist Json     @default("{}")
+  archivedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  client         Client          @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  projectManager User            @relation("ProjectManager", fields: [projectManagerId], references: [id], onDelete: Restrict)
+  technicalLead  User?           @relation("TechnicalLead", fields: [technicalLeadId], references: [id], onDelete: SetNull)
+  members        ProjectMember[]
+  sources        Source[]
+  requirements   Requirement[]
+  deliverables   Deliverable[]
+  milestones     Milestone[]
+  workItems      WorkItem[]
+  baselines      ScopeBaseline[]
+  conflicts      Conflict[]
+  decisions      Decision[]
+  risks          Risk[]
+  changeRequests ChangeRequest[]
+  aiRuns         AiRun[]
+  auditEvents    AuditEvent[]
+  approvals      Approval[]
+
+  @@index([stage, health])
+  @@index([clientId])
+  @@index([projectManagerId])
+}
+
+model ProjectMember {
+  id          String   @id @default(uuid())
+  projectId   String
+  userId      String
+  projectRole Role
+  addedAt     DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([userId])
+}
+
+/* ------------------------------------------------------------------ */
+/* Knowledge centre (§7.1)                                             */
+/* ------------------------------------------------------------------ */
+
+enum SourceKind {
+  PROPOSAL
+  CONTRACT
+  EMAIL
+  TRANSCRIPT
+  BRIEF
+  DESIGN
+  SPREADSHEET
+  NOTE
+  OTHER
+}
+
+enum SourceAuthority {
+  SIGNED_CONTRACT
+  APPROVED_CHANGE_REQUEST
+  WRITTEN_CLIENT_APPROVAL
+  DECISION_RECORD
+  CALL_TRANSCRIPT
+  CLIENT_EMAIL
+  INTERNAL_NOTE
+}
+
+enum SourceProcessingState {
+  PENDING
+  EXTRACTING
+  READY
+  FAILED
+  UNSUPPORTED
+}
+
+/// Raw sources are immutable (§7.1). A correction uploads a new version and
+/// links back via supersedesId; the original text and its fragments survive so
+/// existing citations never dangle.
+model Source {
+  id              String                @id @default(uuid())
+  projectId       String
+  title           String
+  kind            SourceKind
+  authority       SourceAuthority
+  confidentiality Confidentiality       @default(STANDARD)
+  /// When the statement was made, not when the file was uploaded. Precedence
+  /// ties break on this (see resolveAuthority in @deliveryos/shared).
+  statedAt        DateTime
+  notes           String?
+
+  originalFilename String?
+  mimeType         String?
+  byteSize         Int?
+  storageKey       String?
+  checksum         String?
+
+  processingState SourceProcessingState @default(PENDING)
+  processingError String?
+  extractedChars  Int                   @default(0)
+
+  version     Int     @default(1)
+  supersedesId String?
+
+  uploadedById String
+  uploadedAt   DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  project    Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  uploadedBy User             @relation("SourceUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+  supersedes Source?          @relation("SourceVersions", fields: [supersedesId], references: [id], onDelete: SetNull)
+  supersededBy Source[]       @relation("SourceVersions")
+  fragments  SourceFragment[]
+
+  @@index([projectId, processingState])
+  @@index([projectId, authority, statedAt])
+}
+
+/// The addressable unit a citation points at. `locator` is human-readable
+/// ("p. 4, ¶2" / "12:04" / "message 3 of 8") so a reviewer can find the claim
+/// in the original document.
+model SourceFragment {
+  id         String   @id @default(uuid())
+  sourceId   String
+  ordinal    Int
+  locator    String
+  text       String
+  charStart  Int
+  charEnd    Int
+  createdAt  DateTime @default(now())
+
+  source   Source                  @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  citations RequirementCitation[]
+  conflictCitations ConflictCitation[]
+
+  @@unique([sourceId, ordinal])
+  @@index([sourceId])
+}
+
+/* ------------------------------------------------------------------ */
+/* Requirements and scope (§6.2, §7.2, §7.3)                           */
+/* ------------------------------------------------------------------ */
+
+enum RequirementClass {
+  BUSINESS_OBJECTIVE
+  USER_ROLE_PERMISSION
+  FUNCTIONAL_BEHAVIOUR
+  PAGE_SCREEN_CONTENT
+  INTEGRATION_DATA
+  TECHNICAL_CONSTRAINT
+  NON_FUNCTIONAL
+  MIGRATION_LAUNCH_SUPPORT
+  ASSUMPTION_EXCLUSION_QUESTION
+}
+
+enum RequirementPriority {
+  MUST
+  SHOULD
+  COULD
+  WONT
+}
+
+enum RequirementReviewState {
+  DRAFT
+  IN_REVIEW
+  APPROVED
+  REJECTED
+  SUPERSEDED
+}
+
+enum RequirementOrigin {
+  AI_EXTRACTION
+  MANUAL
+  SPLIT
+  MERGE
+  CHANGE_REQUEST
+}
+
+model Requirement {
+  id                 String                 @id @default(uuid())
+  projectId          String
+  reference          String
+  title              String
+  statement          String
+  requirementClass   RequirementClass
+  priority           RequirementPriority    @default(MUST)
+  reviewState        RequirementReviewState @default(DRAFT)
+  origin             RequirementOrigin      @default(AI_EXTRACTION)
+
+  /// 0..1 as produced by the model. Null for manually authored requirements —
+  /// a human statement has no model confidence, and 1.0 would be a lie.
+  confidence         Decimal?               @db.Decimal(3, 2)
+  acceptanceCriteria Json                   @default("[]")
+
+  isExclusion  Boolean @default(false)
+  isAssumption Boolean @default(false)
+  /// Non-null means a human must answer before this is safe to build (§7.2).
+  openQuestion String?
+  questionAnsweredAt DateTime?
+  questionAnswer     String?
+
+  /// Set when this requirement was split, merged or replaced. The old row is
+  /// kept as SUPERSEDED so approved baselines keep resolving.
+  supersededById String?
+
+  aiRunId   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project      Project               @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  aiRun        AiRun?                @relation(fields: [aiRunId], references: [id], onDelete: SetNull)
+  supersededBy Requirement?          @relation("RequirementSupersession", fields: [supersededById], references: [id], onDelete: SetNull)
+  supersedes   Requirement[]         @relation("RequirementSupersession")
+  citations    RequirementCitation[]
+  revisions    RequirementRevision[]
+  deliverables DeliverableRequirement[]
+  baselineEntries BaselineRequirement[]
+  workItems    WorkItem[]
+
+  @@unique([projectId, reference])
+  @@index([projectId, reviewState])
+  @@index([projectId, requirementClass])
+  @@index([aiRunId])
+}
+
+model RequirementCitation {
+  id               String @id @default(uuid())
+  requirementId    String
+  sourceFragmentId String
+  /// Snapshot of the excerpt at extraction time, kept for display only. The
+  /// fragment id is the authority; this is verified against it on write.
+  quote            String
+
+  requirement Requirement    @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  fragment    SourceFragment @relation(fields: [sourceFragmentId], references: [id], onDelete: Cascade)
+
+  @@unique([requirementId, sourceFragmentId])
+  @@index([sourceFragmentId])
+}
+
+/// §7.2 "preserving AI and human history". Every edit, approval and rejection
+/// appends a row; nothing overwrites.
+model RequirementRevision {
+  id            String   @id @default(uuid())
+  requirementId String
+  revision      Int
+  action        String
+  /// Field-level before/after, so the studio can render a real diff.
+  changes       Json     @default("{}")
+  snapshot      Json
+  reason        String?
+  actorId       String
+  createdAt     DateTime @default(now())
+
+  requirement Requirement @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  actor       User        @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@unique([requirementId, revision])
+  @@index([requirementId])
+}
+
+enum ConflictState {
+  OPEN
+  RESOLVED
+  DISMISSED
+}
+
+/// §7.2 "Conflict detection presents both statements and asks an authorised
+/// reviewer to decide". The model may not pick a side.
+model Conflict {
+  id        String        @id @default(uuid())
+  projectId String
+  summary   String
+  statementA String
+  statementB String
+  severity  String        @default("MEDIUM")
+  state     ConflictState @default(OPEN)
+  suggestedResolution String?
+
+  resolution    String?
+  rationale     String?
+  resolvedById  String?
+  resolvedAt    DateTime?
+  decisionId    String?   @unique
+
+  aiRunId   String?
+  createdAt DateTime @default(now())
+
+  project   Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  aiRun     AiRun?             @relation(fields: [aiRunId], references: [id], onDelete: SetNull)
+  decision  Decision?          @relation(fields: [decisionId], references: [id], onDelete: SetNull)
+  citations ConflictCitation[]
+
+  @@index([projectId, state])
+}
+
+model ConflictCitation {
+  id               String @id @default(uuid())
+  conflictId       String
+  sourceFragmentId String
+  side             String
+  quote            String
+
+  conflict Conflict       @relation(fields: [conflictId], references: [id], onDelete: Cascade)
+  fragment SourceFragment @relation(fields: [sourceFragmentId], references: [id], onDelete: Cascade)
+
+  @@index([conflictId])
+  @@index([sourceFragmentId])
+}
+
+enum BaselineState {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  SUPERSEDED
+}
+
+/// The approved, versioned, immutable scope (§7.3). Version N is never edited;
+/// a change produces N+1 and marks N SUPERSEDED.
+model ScopeBaseline {
+  id           String        @id @default(uuid())
+  projectId    String
+  version      Int
+  title        String
+  state        BaselineState @default(DRAFT)
+  changeReason String?
+  effectiveDate DateTime?
+
+  proposedById String?
+  proposedAt   DateTime?
+  approvedById String?
+  approvedAt   DateTime?
+  supersededAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  project      Project               @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  requirements BaselineRequirement[]
+  approvals    Approval[]
+  changeRequests ChangeRequest[]
+
+  @@unique([projectId, version])
+  @@index([projectId, state])
+}
+
+/// A frozen copy, not a pointer. If someone edits the Requirement row later,
+/// the approved baseline still shows exactly what was signed off.
+model BaselineRequirement {
+  id            String @id @default(uuid())
+  baselineId    String
+  requirementId String
+
+  title              String
+  statement          String
+  requirementClass   RequirementClass
+  priority           RequirementPriority
+  acceptanceCriteria Json                @default("[]")
+  isExclusion        Boolean             @default(false)
+  citationSnapshot   Json                @default("[]")
+
+  baseline    ScopeBaseline @relation(fields: [baselineId], references: [id], onDelete: Cascade)
+  requirement Requirement   @relation(fields: [requirementId], references: [id], onDelete: Restrict)
+
+  @@unique([baselineId, requirementId])
+  @@index([requirementId])
+}
+
+/* ------------------------------------------------------------------ */
+/* Delivery: deliverables -> milestones -> work items (§7.4)           */
+/* ------------------------------------------------------------------ */
+
+model Deliverable {
+  id                 String   @id @default(uuid())
+  projectId          String
+  reference          String
+  name               String
+  description        String?
+  acceptanceCriteria Json     @default("[]")
+  ownerId            String?
+  milestoneId        String?
+  completedAt        DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  project      Project                  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  milestone    Milestone?               @relation(fields: [milestoneId], references: [id], onDelete: SetNull)
+  requirements DeliverableRequirement[]
+  workItems    WorkItem[]
+
+  @@unique([projectId, reference])
+  @@index([projectId])
+}
+
+model DeliverableRequirement {
+  deliverableId String
+  requirementId String
+
+  deliverable Deliverable @relation(fields: [deliverableId], references: [id], onDelete: Cascade)
+  requirement Requirement @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+
+  @@id([deliverableId, requirementId])
+  @@index([requirementId])
+}
+
+model Milestone {
+  id          String    @id @default(uuid())
+  projectId   String
+  name        String
+  description String?
+  targetDate  DateTime?
+  actualDate  DateTime?
+  ordinal     Int       @default(0)
+  ownerId     String?
+  /// Rule-derived, like Project.health — never typed in by a PM.
+  confidence  Decimal?  @db.Decimal(3, 2)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  deliverables Deliverable[]
+  workItems    WorkItem[]
+
+  @@index([projectId, targetDate])
+}
+
+enum WorkItemType {
+  TASK
+  SUBTASK
+  BUG
+  ACTION
+}
+
+enum WorkItemStatus {
+  DRAFT
+  NOT_READY
+  READY_TO_START
+  IN_PROGRESS
+  BLOCKED
+  DEVELOPER_REVIEW
+  TECHNICAL_REVIEW
+  QA_REVIEW
+  PM_REVIEW
+  CLIENT_REVIEW
+  ACCEPTED
+  DEPLOYED
+  CLOSED
+}
+
+model WorkItem {
+  id          String         @id @default(uuid())
+  projectId   String
+  reference   String
+  type        WorkItemType   @default(TASK)
+  status      WorkItemStatus @default(DRAFT)
+  title       String
+  brief       String?
+
+  requirementId String?
+  deliverableId String?
+  milestoneId   String?
+  parentId      String?
+
+  assigneeId  String?
+  estimateHours Decimal? @db.Decimal(6, 2)
+  actualHours   Decimal? @db.Decimal(6, 2)
+  dueDate       DateTime?
+  priority      Int      @default(3)
+
+  /// Which review gates this item must clear (§7.6). Drives both the
+  /// status machine and the "In Review" grouping in the UI.
+  reviewRoute        Json @default("[]")
+  definitionOfReady  Json @default("[]")
+  acceptanceCriteria Json @default("[]")
+
+  startedAt   DateTime?
+  acceptedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  requirement Requirement? @relation(fields: [requirementId], references: [id], onDelete: SetNull)
+  deliverable Deliverable? @relation(fields: [deliverableId], references: [id], onDelete: SetNull)
+  milestone   Milestone?   @relation(fields: [milestoneId], references: [id], onDelete: SetNull)
+  assignee    User?        @relation("WorkItemAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  parent      WorkItem?    @relation("WorkItemHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children    WorkItem[]   @relation("WorkItemHierarchy")
+  checklist   ChecklistItem[]
+  evidence    Evidence[]
+  approvals   Approval[]
+  risks       Risk[]
+
+  @@unique([projectId, reference])
+  @@index([projectId, status])
+  @@index([assigneeId, status])
+  @@index([milestoneId])
+}
+
+model ChecklistItem {
+  id         String   @id @default(uuid())
+  workItemId String
+  label      String
+  ownerRole  Role?
+  required   Boolean  @default(true)
+  result     String?
+  checkedById String?
+  checkedAt  DateTime?
+  ordinal    Int      @default(0)
+
+  workItem WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+
+  @@index([workItemId])
+}
+
+model Evidence {
+  id         String   @id @default(uuid())
+  workItemId String
+  kind       String
+  label      String
+  url        String?
+  storageKey String?
+  addedById  String
+  addedAt    DateTime @default(now())
+
+  workItem WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+
+  @@index([workItemId])
+}
+
+/* ------------------------------------------------------------------ */
+/* Governance: approvals, decisions, risks, changes (§4.1, §7.3, §10)  */
+/* ------------------------------------------------------------------ */
+
+enum ApprovalSubject {
+  SCOPE_BASELINE
+  PROJECT_PLAN
+  WORK_ITEM
+  CHANGE_REQUEST
+  RELEASE
+  CLOSURE
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+  RETURNED
+}
+
+model Approval {
+  id         String           @id @default(uuid())
+  projectId  String
+  subject    ApprovalSubject
+  decision   ApprovalDecision
+  comment    String?
+  approverId String
+
+  baselineId      String?
+  workItemId      String?
+  changeRequestId String?
+
+  /// Which baseline version was in force when this was decided (§6.1).
+  baselineVersion Int?
+  createdAt       DateTime @default(now())
+
+  project       Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  approver      User           @relation(fields: [approverId], references: [id], onDelete: Restrict)
+  baseline      ScopeBaseline? @relation(fields: [baselineId], references: [id], onDelete: SetNull)
+  workItem      WorkItem?      @relation(fields: [workItemId], references: [id], onDelete: SetNull)
+  changeRequest ChangeRequest? @relation(fields: [changeRequestId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, subject])
+  @@index([approverId])
+}
+
+model Decision {
+  id          String   @id @default(uuid())
+  projectId   String
+  question    String
+  options     Json     @default("[]")
+  chosen      String
+  rationale   String
+  decidedById String
+  decidedAt   DateTime @default(now())
+  affectedRecords Json @default("[]")
+
+  project   Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  decidedBy User      @relation(fields: [decidedById], references: [id], onDelete: Restrict)
+  conflict  Conflict?
+
+  @@index([projectId])
+}
+
+enum RiskKind {
+  RISK
+  ISSUE
+  BLOCKER
+  DEPENDENCY
+}
+
+enum RiskState {
+  OPEN
+  MITIGATING
+  ESCALATED
+  RESOLVED
+  CLOSED
+}
+
+model Risk {
+  id        String    @id @default(uuid())
+  projectId String
+  kind      RiskKind
+  state     RiskState @default(OPEN)
+  title     String
+  detail    String?
+  /// §10.6 blocker taxonomy; drives owner routing and the SLA timer.
+  category  String?
+  severity  String    @default("MEDIUM")
+  probability String?
+  impact      String?
+  ownerId     String?
+  workItemId  String?
+  action      String?
+  dueDate     DateTime?
+  escalatedAt DateTime?
+  resolvedAt  DateTime?
+  resolution  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project  Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  owner    User?     @relation("RiskOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  workItem WorkItem? @relation(fields: [workItemId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, kind, state])
+  @@index([ownerId, state])
+}
+
+enum ChangeRequestState {
+  DRAFT
+  ASSESSING
+  AWAITING_CLIENT
+  APPROVED
+  REJECTED
+  WITHDRAWN
+}
+
+model ChangeRequest {
+  id        String             @id @default(uuid())
+  projectId String
+  reference String
+  title     String
+  request   String
+  state     ChangeRequestState @default(DRAFT)
+  classification String?
+
+  effortHours   Decimal?  @db.Decimal(8, 2)
+  costAmount    Decimal?  @db.Decimal(14, 2)
+  scheduleImpactDays Int?
+  affectedRecords Json    @default("[]")
+
+  /// Set once approved; the baseline version this change produced.
+  resultingBaselineId String?
+  clientApprovalEvidence String?
+
+  raisedById String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  project           Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  resultingBaseline ScopeBaseline? @relation(fields: [resultingBaselineId], references: [id], onDelete: SetNull)
+  approvals         Approval[]
+
+  @@unique([projectId, reference])
+  @@index([projectId, state])
+}
+
+/* ------------------------------------------------------------------ */
+/* AI runs (§8)                                                        */
+/* ------------------------------------------------------------------ */
+
+enum AiJobType {
+  REQUIREMENT_EXTRACTION
+  CONFLICT_DETECTION
+  SCOPE_COMPARISON
+  PLAN_GENERATION
+  DAILY_AGENDA
+  RISK_MONITOR
+  QA_SUGGESTION
+  STATUS_DRAFT
+  PROJECT_MEMORY
+}
+
+enum AiRunState {
+  QUEUED
+  RUNNING
+  AWAITING_REVIEW
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum AiProvider {
+  ANTHROPIC
+  OPENAI
+}
+
+/// §8.4 "Record prompt, schema and model-policy versions for every AI run".
+/// This table is what makes an extraction reproducible and auditable a year
+/// later, and what the cost dashboard reads.
+model AiRun {
+  id        String     @id @default(uuid())
+  projectId String
+  jobType   AiJobType
+  state     AiRunState @default(QUEUED)
+
+  provider      AiProvider
+  model         String
+  promptVersion String
+  schemaVersion String
+
+  /// Ids of the sources fed in, so a run can be replayed from the same inputs.
+  inputSourceIds Json  @default("[]")
+  inputChars     Int   @default(0)
+  instructions   String?
+
+  inputTokens  Int?
+  outputTokens Int?
+  costUsd      Decimal? @db.Decimal(10, 4)
+  latencyMs    Int?
+
+  producedCount Int      @default(0)
+  warnings      Json     @default("[]")
+  error         String?
+
+  triggeredById String
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  createdAt     DateTime @default(now())
+
+  project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  triggeredBy  User          @relation(fields: [triggeredById], references: [id], onDelete: Restrict)
+  requirements Requirement[]
+  conflicts    Conflict[]
+
+  @@index([projectId, jobType, createdAt])
+  @@index([state])
+}
+
+/* ------------------------------------------------------------------ */
+/* Audit (§4.1, §15.3)                                                 */
+/* ------------------------------------------------------------------ */
+
+/// Append-only. There is deliberately no update or delete path in the
+/// application layer; the writer in src/lib/audit.ts is the only entry point.
+model AuditEvent {
+  id         String   @id @default(uuid())
+  projectId  String?
+  actorId    String?
+  /// Dotted verb, e.g. "baseline.approved", "requirement.rejected".
+  action     String
+  entityType String
+  entityId   String?
+  summary    String
+  /// Before/after for the fields that changed. Never contains secrets.
+  detail     Json     @default("{}")
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  project Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  actor   User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+  @@index([action])
+}

@@ -1,0 +1,32 @@
+{
+  "name": "teqdeft-delivery-os",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Teqdeft Delivery OS — AI-assisted delivery operating system for an agency",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build -w @deliveryos/shared && npm run build -w @deliveryos/api && npm run build -w @deliveryos/web",
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "npm run dev -w @deliveryos/api",
+    "dev:web": "npm run dev -w @deliveryos/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint . --ext .ts,.tsx",
+    "test": "npm run test --workspaces --if-present",
+    "db:migrate": "npm run db:migrate -w @deliveryos/api",
+    "db:push": "npm run db:push -w @deliveryos/api",
+    "db:seed": "npm run db:seed -w @deliveryos/api",
+    "db:studio": "npm run db:studio -w @deliveryos/api",
+    "setup": "npm install && npm run build -w @deliveryos/shared && npm run db:push && npm run db:seed"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  }
+}
