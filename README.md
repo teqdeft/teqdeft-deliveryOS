@@ -159,5 +159,8 @@ These are known gaps, not oversights:
   is already written to be callable from a worker unchanged.
 - **`JWT_SECRET` must be replaced.** Generate one with
   `openssl rand -base64 48`.
+- **Provider keys belong in the environment, never in the repo.** `.env` is
+  gitignored. A key that has ever been pasted into a chat, an issue or a
+  screenshot should be rotated at the provider before it goes near production.
 - **Retention and deletion (§16.1) are not implemented.** Decide the policy
   before real client documents are ingested.

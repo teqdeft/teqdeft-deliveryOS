@@ -4,6 +4,7 @@ import { openaiAdapter } from './adapters/openai.js';
 import { estimateCostUsd, resolvePolicy } from './model-policy.js';
 import type { GatewayResponse, ProviderAdapter } from './types.js';
 import { logger } from '../lib/logger.js';
+import { isProviderError, toProviderError } from './errors.js';
 
 const ADAPTERS: Record<AiProvider, ProviderAdapter> = {
   ANTHROPIC: anthropicAdapter,
@@ -73,6 +74,9 @@ export async function callModel(call: GatewayCall): Promise<GatewayResult> {
     }
   }
 
+  // Never let a raw SDK error escape the gateway. Everything above this layer
+  // works with typed application errors carrying an actionable message.
+  if (isProviderError(lastError)) throw toProviderError(lastError, policy.provider);
   throw lastError;
 }
 

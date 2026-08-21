@@ -120,7 +120,18 @@ export function Analysis() {
             />
           </div>
 
-          {analyse.error ? <ErrorNote error={analyse.error} className="mt-3" /> : null}
+          {analyse.error ? (
+            <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3">
+              <p className="text-sm font-semibold text-red-900">Analysis could not run</p>
+              <p className="mt-1 text-sm text-red-800">
+                {analyse.error instanceof Error ? analyse.error.message : String(analyse.error)}
+              </p>
+              <p className="mt-2 text-xs text-red-700">
+                Nothing was saved. The attempt is recorded in the run history below with its error, so an
+                administrator can see what happened.
+              </p>
+            </div>
+          ) : null}
 
           <div className="mt-4 flex items-center gap-3">
             <Button

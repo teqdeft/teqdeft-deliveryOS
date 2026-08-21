@@ -15,7 +15,11 @@ const DATABASE_URL =
   process.env.TEST_DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/deliveryos_test?schema=public';
 process.env.DATABASE_URL = DATABASE_URL;
 process.env.JWT_SECRET = 'test-secret-that-is-long-enough-for-validation';
+// Pin the provider rather than inheriting whatever a developer has in .env —
+// otherwise these assertions pass or fail based on local configuration.
 process.env.ANTHROPIC_API_KEY = 'test-key-so-the-policy-resolves';
+process.env.OPENAI_API_KEY = '';
+process.env.AI_DEFAULT_PROVIDER = 'ANTHROPIC';
 
 /** Whatever the stub is set to is what the "model" returns for the next run. */
 let stubbedResult: ExtractionResult = { requirements: [], conflicts: [], gaps: [] };

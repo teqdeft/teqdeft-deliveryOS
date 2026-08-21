@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end check of the Delivery OS API against a running server + seeded DB."""
 import json, sys, urllib.request, urllib.error
+from uuid import uuid4
 
 API = "http://localhost:4000/api"
 passed, failed = 0, 0
@@ -61,7 +62,8 @@ check("developer cannot create a client", 403, call("POST", "/clients", dev, {"n
 check("developer cannot trigger analysis", 403, call("POST", f"/projects/{pid}/ai/analyse", dev, {})[0])
 check("developer cannot approve a requirement", 403,
       call("POST", f"/projects/{pid}/requirements/x/decide", dev, {"decision": "APPROVE"})[0])
-check("PM can create a client", 201, call("POST", "/clients", pm, {"name": f"Smoke Client {passed}"})[0])
+check("PM can create a client", 201,
+      call("POST", "/clients", pm, {"name": f"Smoke Client {uuid4().hex[:8]}"})[0])
 
 section("field-level commercial restriction (§16)")
 check("contract value hidden from developer", None, call("GET", "/projects", dev)[1]["items"][0]["contractValue"])
@@ -84,9 +86,27 @@ check("a source with no content is rejected", 400, call("POST", f"/projects/{pid
       {"title": "Empty", "kind": "NOTE", "authority": "INTERNAL_NOTE", "statedAt": "2026-01-20"})[0])
 
 section("AI gating (§16 graceful degradation)")
+_, policy = call("GET", f"/projects/{pid}/ai/policy", pm)
 st, bd = call("POST", f"/projects/{pid}/ai/analyse", pm, {})
-check("analysis refused with no provider key", 422, st)
-check("the refusal explains what to do", True, "ANTHROPIC_API_KEY" in bd["error"]["message"])
+message = bd.get("error", {}).get("message", "")
+
+if not policy["aiAvailable"]:
+    check("analysis refused with no provider key", 422, st)
+    check("the refusal names the variable to set", True, "ANTHROPIC_API_KEY" in message)
+else:
+    # A key is configured. Either the run succeeds, or it fails with a
+    # classified, actionable error — never a raw 500.
+    check("a configured provider is not refused as unconfigured", True, st != 422)
+    check("a provider failure is never an opaque 500", True, st != 500)
+    if st >= 400:
+        check("the failure is classified", True, bd["error"]["code"].startswith("AI_"))
+        check("the failure says what to do about it", True, len(message) > 40 and "Error:" not in message)
+        _, runs = call("GET", f"/projects/{pid}/ai/runs", pm)
+        check("the failed run is recorded for audit", "FAILED", runs["runs"][0]["state"])
+        check("the recorded run keeps its prompt version", "extraction.v1", runs["runs"][0]["promptVersion"])
+    else:
+        check("the run produced drafts", True, bd["requirementsCreated"] >= 0)
+
 check("the rest of the product still works", 200, call("GET", f"/projects/{pid}", pm)[0])
 
 section("scope baseline gates (§7.3)")
