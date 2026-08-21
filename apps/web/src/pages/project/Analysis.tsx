@@ -26,7 +26,7 @@ export function Analysis() {
     queryKey: ['airuns', projectId],
     queryFn: () => get<{ runs: AiRunView[]; spend: { costUsd: string | null }; aiAvailable: boolean }>(`/projects/${projectId}/ai/runs`),
   });
-  const { data: policy } = useQuery({
+  const { data: policy, isLoading: policyLoading, error: policyError } = useQuery({
     queryKey: ['aipolicy', projectId],
     queryFn: () => get<{ aiAvailable: boolean; policy: { provider: string; model: string; effort: string; maxInputChars: number } | null }>(
       `/projects/${projectId}/ai/policy`,
@@ -68,7 +68,7 @@ export function Analysis() {
         </p>
       </div>
 
-      {policy && !policy.aiAvailable && (
+      {!policyLoading && policy && !policy.aiAvailable && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
           <p className="text-sm font-semibold text-amber-900">No AI provider configured</p>
           <p className="mt-1 text-sm text-amber-800">
@@ -136,13 +136,23 @@ export function Analysis() {
           <div className="mt-4 flex items-center gap-3">
             <Button
               variant="primary"
-              disabled={!can('ai.run') || analysable.length === 0 || !policy?.aiAvailable}
-              loading={analyse.isPending}
+              // While the policy is still loading the button is disabled but
+              // shows a loading state, so it never reads as "broken" — and if
+              // the policy call failed outright, the reason is spelled out
+              // beside it rather than leaving a dead control.
+              disabled={!can('ai.run') || analysable.length === 0 || policyLoading || !policy?.aiAvailable}
+              loading={analyse.isPending || policyLoading}
               onClick={() => { setOutcome(null); analyse.mutate(); }}
             >
-              {analyse.isPending ? 'Analysing…' : 'Run analysis'}
+              {analyse.isPending ? 'Analysing…' : policyLoading ? 'Checking provider…' : 'Run analysis'}
             </Button>
             {!can('ai.run') && <span className="text-xs text-ink-400">Your role cannot trigger analysis.</span>}
+            {policyError !== null && policyError !== undefined && (
+              <span className="text-xs text-red-600">
+                Could not check the AI configuration on this server. Reload the page, or ask an administrator to
+                check the API is healthy.
+              </span>
+            )}
             {policy?.policy && (
               <span className="text-xs text-ink-400">
                 {policy.policy.provider} · {policy.policy.model} · {(selectedChars / 1000).toFixed(0)}k of{' '}
