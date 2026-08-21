@@ -6,6 +6,7 @@
  * Studio, the conflict screen and the health rules all have something real to
  * show before any AI key is configured.
  */
+import 'dotenv/config';
 import { PrismaClient, type Prisma } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import { extractFragments } from '../src/modules/sources/extract.js';
@@ -13,6 +14,17 @@ import { extractFragments } from '../src/modules/sources/extract.js';
 const prisma = new PrismaClient();
 
 const DEMO_PASSWORD = 'DeliveryOS2026!';
+
+/**
+ * Dates are relative to the day the seed runs, so the demo tells a coherent
+ * story whenever it is set up: the deal was signed six weeks ago, the kickoff
+ * call was a month ago, and the launch is still ten weeks out. Hard-coded
+ * dates would have the sample project months overdue by the time anyone
+ * opened it.
+ */
+const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000);
+const daysAhead = (n: number) => new Date(Date.now() + n * 86_400_000);
+const iso = (d: Date) => d.toISOString().slice(0, 10);
 
 const PEOPLE = [
   { email: 'kulwant@teqdeft.com', name: 'Kulwant Singh', role: 'FOUNDER', jobTitle: 'Founder', color: '#00A8FF' },
@@ -64,7 +76,7 @@ const TRANSCRIPT = `00:00:08 Priya: Thanks for making time. I want to walk throu
 
 00:00:41 Priya: Understood. When is the expo exactly?
 
-00:00:47 Meera: It opens on the fifteenth of March. So we'd want to be live by, say, the tenth to be safe.
+00:00:47 Meera: It opens ten weeks from now. So we'd want to be live about a week before that, to be safe.
 
 00:01:12 Priya: That's tighter than the ten weeks in the proposal. I'll need to check with our technical lead on what's achievable. Let me flag that as something we need to resolve this week.
 
@@ -96,7 +108,7 @@ Hi Priya,
 
 Thanks for the notes. Two corrections after speaking to the team internally.
 
-First, on the launch date. I said the tenth of March on our call but our marketing lead has now confirmed the expo actually opens on the twenty-second, not the fifteenth. So we have a little more room than I thought — being live by the eighteenth of March would be fine. Sorry for the confusion.
+First, on the launch date. On our call I said the expo opens in ten weeks, but our marketing lead has now confirmed it is eleven weeks out, not ten. So we have a little more room than I thought. Sorry for the confusion.
 
 Second, on the product count. I checked with our operations team and the correct number for launch is seventy-four products, not ninety. The remaining products in the new range won't have photography ready in time and we'll add them ourselves afterwards through the CMS.
 
@@ -162,15 +174,15 @@ async function main() {
       stage: 'AI_ANALYSIS',
       projectManagerId: users.PROJECT_MANAGER!,
       technicalLeadId: users.CTO!,
-      startDate: new Date('2026-01-12'),
-      targetLaunchDate: new Date('2026-03-18'),
+      startDate: daysAgo(40),
+      targetLaunchDate: daysAhead(70),
       contractValue: 850000,
       currency: 'INR',
       intakeChecklist: {
-        PROPOSAL: { done: true, note: 'Signed 9 January', by: 'Arjun Patel', at: '2026-01-09T10:00:00Z' },
+        PROPOSAL: { done: true, note: `Signed ${iso(daysAgo(44))}`, by: 'Arjun Patel', at: daysAgo(44).toISOString() },
         DEADLINES: { done: false, note: 'Expo date changed twice — see conflict', by: null, at: null },
         DESIGNS: { done: false, note: null, by: null, at: null },
-        CONTENT_OWNERSHIP: { done: true, note: 'Client supplies all copy and imagery', by: 'Priya Sharma', at: '2026-01-12T09:00:00Z' },
+        CONTENT_OWNERSHIP: { done: true, note: 'Client supplies all copy and imagery', by: 'Priya Sharma', at: daysAgo(40).toISOString() },
         CREDENTIALS: { done: false, note: 'Awaiting Shopify export access', by: null, at: null },
         CLIENT_DEPENDENCIES: { done: false, note: null, by: null, at: null },
       } as Prisma.InputJsonValue,
@@ -196,7 +208,7 @@ async function main() {
       stage: 'DELIVERY_INTAKE',
       projectManagerId: users.PROJECT_MANAGER!,
       technicalLeadId: users.CTO!,
-      targetLaunchDate: new Date('2026-05-30'),
+      targetLaunchDate: daysAhead(140),
       contractValue: 1450000,
       currency: 'INR',
       members: { create: [{ userId: users.PROJECT_MANAGER!, projectRole: 'PROJECT_MANAGER' }] },
@@ -211,9 +223,9 @@ async function main() {
     text: string;
     uploader: string;
   }[] = [
-    { title: 'Signed proposal — Northwind Organics website rebuild', kind: 'PROPOSAL', authority: 'SIGNED_CONTRACT', statedAt: '2026-01-09', text: PROPOSAL, uploader: 'SALES' },
-    { title: 'Kickoff call with Meera Krishnan', kind: 'TRANSCRIPT', authority: 'CALL_TRANSCRIPT', statedAt: '2026-01-14', text: TRANSCRIPT, uploader: 'PROJECT_MANAGER' },
-    { title: 'Re: Northwind website — kickoff notes', kind: 'EMAIL', authority: 'CLIENT_EMAIL', statedAt: '2026-01-16', text: EMAIL, uploader: 'PROJECT_MANAGER' },
+    { title: 'Signed proposal — Northwind Organics website rebuild', kind: 'PROPOSAL', authority: 'SIGNED_CONTRACT', statedAt: iso(daysAgo(44)), text: PROPOSAL, uploader: 'SALES' },
+    { title: 'Kickoff call with Meera Krishnan', kind: 'TRANSCRIPT', authority: 'CALL_TRANSCRIPT', statedAt: iso(daysAgo(39)), text: TRANSCRIPT, uploader: 'PROJECT_MANAGER' },
+    { title: 'Re: Northwind website — kickoff notes', kind: 'EMAIL', authority: 'CLIENT_EMAIL', statedAt: iso(daysAgo(37)), text: EMAIL, uploader: 'PROJECT_MANAGER' },
   ];
 
   for (const source of sources) {

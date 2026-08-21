@@ -28,7 +28,9 @@ sourcesRouter.get(
 
     const sources = await prisma.source.findMany({
       where: { projectId: project.id },
-      orderBy: [{ statedAt: 'desc' }],
+      // Authority first, then recency within a rank — the same precedence the
+      // conflict resolver applies, so the list reads in decision order.
+      orderBy: [{ authority: 'asc' }, { statedAt: 'desc' }],
       include: {
         uploadedBy: { select: { id: true, name: true, avatarColor: true } },
         _count: { select: { fragments: true } },

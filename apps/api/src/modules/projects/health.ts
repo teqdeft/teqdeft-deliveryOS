@@ -125,6 +125,36 @@ export async function computeProjectHealth(projectId: string): Promise<HealthRes
     score += staleness * 8;
   }
 
+  // A project past its own launch date is the single loudest signal there is,
+  // and milestone rules miss it entirely on a project that never had its
+  // milestones planned out. Without this, a project months past its promised
+  // launch reads as "no risk signals" — exactly the blind spot this product
+  // exists to remove.
+  const launchOverdueDays = project.targetLaunchDate
+    ? Math.floor((now.getTime() - project.targetLaunchDate.getTime()) / 86_400_000)
+    : null;
+
+  if (launchOverdueDays !== null && launchOverdueDays > 0 && project.stage !== 'CLOSURE_AND_LEARNING') {
+    const points = launchOverdueDays > 14 ? 60 : 35;
+    facts.push({
+      rule: 'launch.overdue',
+      label: 'Past its target launch date',
+      detail: `The agreed launch date passed ${launchOverdueDays} day${launchOverdueDays === 1 ? '' : 's'} ago and the project is still in ${project.stage.toLowerCase().replace(/_/g, ' ')}.`,
+      severity: 'CRITICAL',
+      points,
+    });
+    score += points;
+  } else if (launchOverdueDays !== null && launchOverdueDays > -14 && launchOverdueDays <= 0) {
+    const away = Math.abs(launchOverdueDays);
+    facts.push({
+      rule: 'launch.imminent',
+      label: 'Launch is close',
+      detail: `${away} day${away === 1 ? '' : 's'} until the agreed launch date.`,
+      severity: 'INFO',
+      points: 0,
+    });
+  }
+
   // §7.3: execution against an unapproved baseline is a control failure, not a
   // scheduling problem — it outranks everything above.
   const pastPlanning = ['EXECUTION', 'QA_AND_ACCEPTANCE', 'LAUNCH_AND_HYPERCARE'].includes(project.stage);
@@ -142,7 +172,7 @@ export async function computeProjectHealth(projectId: string): Promise<HealthRes
   // §13.1 GREY: stale or absent data means we decline to judge rather than
   // claim green. A silent project is not a healthy project.
   const daysSinceUpdate = Math.floor((now.getTime() - project.updatedAt.getTime()) / 86_400_000);
-  const hasSignal = facts.length > 0 || overdueMilestones.length > 0;
+  const hasSignal = facts.some((f) => f.points > 0) || overdueMilestones.length > 0;
   if (!hasSignal && daysSinceUpdate > 14) {
     return {
       health: 'GREY',
