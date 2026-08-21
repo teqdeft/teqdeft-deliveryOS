@@ -37,20 +37,21 @@ the later releases build on.
 
 ## Running it
 
-You need **Node 20 or newer** and either **Docker Desktop** (easiest) or your
-own MySQL 8 on `localhost:3306`.
+**Full instructions, including Windows and XAMPP: [`LOCAL-SETUP.md`](LOCAL-SETUP.md)**
+
+You need Node 20+ and a MySQL 8 (or MariaDB 10.2+). Docker Desktop is the
+easiest way to get one; an existing XAMPP/WAMP works too.
 
 ```bash
 git clone https://github.com/teqdeft/teqdeft-deliveryOS
 cd teqdeft-deliveryOS
-./setup.sh          # starts the database, installs everything, loads demo data
+npm install
+npm run setup       # finds a database, writes .env, migrates, seeds demo data
 npm run dev         # API on :4000, web on :5173
 ```
 
-`setup.sh` is safe to run as many times as you like. It checks your setup,
-starts MySQL in Docker if it can, generates a real signing secret, runs the
-migrations, and loads a demo project. If something is missing it tells you
-exactly what to install.
+`npm run setup` runs on Windows, macOS and Linux alike, is safe to re-run, and
+names the exact fix when it cannot reach the database.
 
 Open <http://localhost:5173> and sign in as any seeded account — the password
 for all of them is `DeliveryOS2026!`:

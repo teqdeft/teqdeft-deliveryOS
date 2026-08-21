@@ -78,6 +78,15 @@ the whole data layer.
    `AiRun` first, validate the result with Zod, verify every citation against
    the corpus, then persist inside one transaction.
 
+## Local setup
+
+`npm run setup` (`scripts/setup.mjs`) is the one entry point, and it is Node
+rather than bash so it runs on Windows without WSL. It finds a database however
+it can — Docker, an existing MySQL, XAMPP — and when it cannot, it names the
+specific fix. Keep it that way: MySQL reports a missing database and a wrong
+password both as "Access denied", and telling them apart is the difference
+between a one-line fix and an hour lost.
+
 ## Testing
 
 `npm test` for units, including an integration suite that runs the extraction
@@ -96,7 +105,7 @@ readable as a list of the product's promises.
   `dotenv/config` itself. Don't remove those imports or they lose the database
   configuration.
 - MySQL's first container boot initialises its data directory and is much
-  slower than Postgres's. `setup.sh` waits up to 90 seconds for a reason.
+  slower than Postgres's. `scripts/setup.mjs` waits up to 90 seconds for a reason.
 - The workspace pins a single `vite` via `overrides` in the root
   `package.json`. Two copies produce unrelated TypeScript plugin types and the
   web build stops typechecking.

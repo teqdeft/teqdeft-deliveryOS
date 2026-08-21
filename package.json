@@ -2,7 +2,7 @@
   "name": "teqdeft-delivery-os",
   "private": true,
   "version": "0.1.0",
-  "description": "Teqdeft Delivery OS — AI-assisted delivery operating system for an agency",
+  "description": "Teqdeft Delivery OS \u2014 AI-assisted delivery operating system for an agency",
   "workspaces": [
     "packages/*",
     "apps/*"
@@ -19,10 +19,11 @@
     "lint": "eslint . --ext .ts,.tsx",
     "test": "npm run test --workspaces --if-present",
     "db:migrate": "npm run db:migrate -w @deliveryos/api",
-    "db:push": "npm run db:push -w @deliveryos/api",
     "db:seed": "npm run db:seed -w @deliveryos/api",
-    "db:studio": "npm run db:studio -w @deliveryos/api",
-    "setup": "npm install && npm run build -w @deliveryos/shared && npm run db:push && npm run db:seed"
+    "setup": "node scripts/setup.mjs",
+    "db:status": "npm run db:status -w @deliveryos/api",
+    "db:rollback": "npm run db:rollback -w @deliveryos/api",
+    "preflight": "node deploy/preflight.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
