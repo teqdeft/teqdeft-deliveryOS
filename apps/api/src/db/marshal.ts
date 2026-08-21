@@ -98,7 +98,7 @@ export function defined<T extends Record<string, unknown>>(input: T): Partial<T>
  * "100%" or "a_b" matches those literal strings.
  *
  * Case sensitivity differs from PostgreSQL and is worth being explicit about:
- * the schema uses utf8mb4_0900_ai_ci, an accent- and case-insensitive
+ * the schema uses utf8mb4_unicode_ci, an accent- and case-insensitive
  * collation, so LIKE is already case-insensitive. That matches what the API
  * did before with Prisma's `mode: 'insensitive'`.
  */

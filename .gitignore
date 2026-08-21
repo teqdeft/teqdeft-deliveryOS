@@ -22,3 +22,6 @@ npm-debug.log*
 !.vscode/extensions.json
 
 apps/api/prisma/migrations/dev.db*
+
+# Build output of deploy/package.sh — artefacts, not source.
+deploy/dist/

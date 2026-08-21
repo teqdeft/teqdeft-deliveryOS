@@ -150,6 +150,27 @@ rules, and the audit trail.
 
 ## Deployment
 
+**Deploying to cPanel or shared hosting?** Follow `deploy/CPANEL.md`. It is
+written step by step for cPanel's UI, and `deploy/package.sh` builds the two
+archives it asks for.
+
+Before deploying anywhere, run the preflight on the target host:
+
+```bash
+npm run preflight
+```
+
+It checks the Node version, the MySQL/MariaDB version and charset, whether the
+database user can actually create foreign keys, whether uploads are writable,
+and whether `JWT_SECRET` is still the placeholder — each of which otherwise
+shows up much later as a blank page or silently mangled text.
+
+The schema runs on **MySQL 5.7+ or MariaDB 10.2+**, and every table is created
+`utf8mb4` explicitly rather than inheriting the database default, because
+shared hosts still create databases as latin1.
+
+### Manual deployment
+
 ```bash
 npm run build
 npm run db:deploy -w @deliveryos/api   # apply migrations

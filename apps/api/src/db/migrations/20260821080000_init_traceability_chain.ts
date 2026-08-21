@@ -11,8 +11,14 @@ import { values } from '../enums.js';
  * - **DATETIME(3), not TIMESTAMP.** MySQL's TIMESTAMP tops out in 2038 and
  *   silently rewrites values across session time zones. DATETIME(3) preserves
  *   the millisecond precision the old `timestamp(3)` columns had.
- * - **utf8mb4 throughout.** Fragment locators contain `¶` and em-dashes;
- *   three-byte utf8 mangles them.
+ * - **utf8mb4 set explicitly on every table**, never inherited. A table with no
+ *   charset takes the database's default, and shared hosts still create
+ *   databases as latin1 — which silently mangles every `¶` and em-dash in a
+ *   source fragment rather than failing. `utf8mb4_unicode_ci` is used rather
+ *   than MySQL 8's `utf8mb4_0900_ai_ci` because the latter does not exist on
+ *   MariaDB or MySQL 5.7, and shared hosting runs one of those far more often
+ *   than it runs MySQL 8. Both are accent- and case-insensitive, so `LIKE`
+ *   behaves the same either way.
  * - **VARCHAR(191) on indexed strings.** Long enough for every real value and
  *   safely under InnoDB's index key limit on any row format or MySQL build.
  * - **TEXT / MEDIUMTEXT for prose.** Source fragments and statements exceed
@@ -21,8 +27,16 @@ import { values } from '../enums.js';
  *   but MySQL creates an index for an FK automatically and it is easy to end
  *   up with duplicates; naming them keeps the set intentional.
  */
+/** Every table is created with this; none inherits the database default. */
+const CHARSET = 'utf8mb4';
+const COLLATION = 'utf8mb4_unicode_ci';
+
 export async function up(knex: Knex): Promise<void> {
   const id = (t: Knex.CreateTableBuilder, column = 'id') => t.string(column, 36);
+  const charset = (t: Knex.CreateTableBuilder) => {
+    t.charset(CHARSET);
+    t.collate(COLLATION);
+  };
   // Millisecond precision, matching the previous schema. `now(3)` rather than
   // `now()` or the default drops the fractional part on insert.
   const created = (t: Knex.CreateTableBuilder, column = 'createdAt') =>
@@ -36,6 +50,7 @@ export async function up(knex: Knex): Promise<void> {
   /* ---------------- identity and access ---------------- */
 
   await knex.schema.createTable('User', (t) => {
+    charset(t);
     id(t).primary();
     t.string('email', 191).notNullable().unique();
     t.string('name', 191).notNullable();
@@ -53,6 +68,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('Client', (t) => {
+    charset(t);
     id(t).primary();
     t.string('name', 191).notNullable().unique();
     t.string('contactName', 191).nullable();
@@ -66,6 +82,7 @@ export async function up(knex: Knex): Promise<void> {
   /* ---------------- projects ---------------- */
 
   await knex.schema.createTable('Project', (t) => {
+    charset(t);
     id(t).primary();
     t.string('code', 24).notNullable().unique();
     t.string('name', 191).notNullable();
@@ -100,6 +117,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('ProjectMember', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     id(t, 'userId').notNullable();
@@ -114,6 +132,7 @@ export async function up(knex: Knex): Promise<void> {
   /* ---------------- knowledge centre ---------------- */
 
   await knex.schema.createTable('Source', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.string('title', 255).notNullable();
@@ -144,6 +163,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('SourceFragment', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'sourceId').notNullable();
     t.integer('ordinal').notNullable();
@@ -162,6 +182,7 @@ export async function up(knex: Knex): Promise<void> {
   /* ---------------- requirements and scope ---------------- */
 
   await knex.schema.createTable('AiRun', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.enu('jobType', values('AiJobType')).notNullable();
@@ -191,6 +212,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('Requirement', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.string('reference', 24).notNullable();
@@ -222,6 +244,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('RequirementCitation', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'requirementId').notNullable();
     id(t, 'sourceFragmentId').notNullable();
@@ -233,6 +256,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('RequirementRevision', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'requirementId').notNullable();
     t.integer('revision').notNullable();
@@ -249,6 +273,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('Decision', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.text('question').notNullable();
@@ -264,6 +289,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('Conflict', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.text('summary').notNullable();
@@ -287,6 +313,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('ConflictCitation', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'conflictId').notNullable();
     id(t, 'sourceFragmentId').notNullable();
@@ -299,6 +326,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('ScopeBaseline', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.integer('version').notNullable();
@@ -318,6 +346,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('Milestone', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.string('name', 191).notNullable();
@@ -334,6 +363,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('Deliverable', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.string('reference', 24).notNullable();
@@ -352,6 +382,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('BaselineRequirement', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'baselineId').notNullable();
     id(t, 'requirementId').notNullable();
@@ -371,6 +402,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('DeliverableRequirement', (t) => {
+    charset(t);
     id(t, 'deliverableId').notNullable();
     id(t, 'requirementId').notNullable();
     t.primary(['deliverableId', 'requirementId']);
@@ -382,6 +414,7 @@ export async function up(knex: Knex): Promise<void> {
   /* ---------------- delivery ---------------- */
 
   await knex.schema.createTable('WorkItem', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.string('reference', 24).notNullable();
@@ -418,6 +451,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('ChecklistItem', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'workItemId').notNullable();
     t.string('label', 255).notNullable();
@@ -432,6 +466,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('Evidence', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'workItemId').notNullable();
     t.string('kind', 64).notNullable();
@@ -447,6 +482,7 @@ export async function up(knex: Knex): Promise<void> {
   /* ---------------- governance ---------------- */
 
   await knex.schema.createTable('ChangeRequest', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.string('reference', 24).notNullable();
@@ -470,6 +506,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('Approval', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.enu('subject', values('ApprovalSubject')).notNullable();
@@ -491,6 +528,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   await knex.schema.createTable('Risk', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').notNullable();
     t.enu('kind', values('RiskKind')).notNullable();
@@ -520,6 +558,7 @@ export async function up(knex: Knex): Promise<void> {
   /* ---------------- audit ---------------- */
 
   await knex.schema.createTable('AuditEvent', (t) => {
+    charset(t);
     id(t).primary();
     id(t, 'projectId').nullable();
     id(t, 'actorId').nullable();
