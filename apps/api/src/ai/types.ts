@@ -1,4 +1,4 @@
-import type { AiProvider } from '@prisma/client';
+import type { AiProvider } from '@deliveryos/shared';
 
 export interface GatewayRequest {
   system: string;

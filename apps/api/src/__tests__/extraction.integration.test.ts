@@ -11,9 +11,11 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { ExtractionResult } from '@deliveryos/shared';
 
-const DATABASE_URL =
-  process.env.TEST_DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/deliveryos_test?schema=public';
-process.env.DATABASE_URL = DATABASE_URL;
+process.env.DB_HOST = process.env.TEST_DB_HOST ?? '127.0.0.1';
+process.env.DB_PORT = process.env.TEST_DB_PORT ?? '3306';
+process.env.DB_NAME = process.env.TEST_DB_NAME ?? 'deliveryos_test';
+process.env.DB_USER = process.env.TEST_DB_USER ?? 'deliveryos';
+process.env.DB_PASSWORD = process.env.TEST_DB_PASSWORD ?? 'deliveryos';
 process.env.JWT_SECRET = 'test-secret-that-is-long-enough-for-validation';
 // Pin the provider rather than inheriting whatever a developer has in .env —
 // otherwise these assertions pass or fail based on local configuration.
@@ -38,78 +40,96 @@ vi.mock('../ai/gateway.js', () => ({
   })),
 }));
 
-const { prisma } = await import('../db.js');
+const { db, closeDb, fromJson, newId, toBool, toNumber } = await import('../db/index.js');
 const { extractRequirements } = await import('../ai/jobs/extract-requirements.js');
 
 let projectId = '';
 let userId = '';
 let realFragmentIds: string[] = [];
-let available = true;
+
+/**
+ * Decided at module load, not in beforeAll: `describe.skipIf` is evaluated
+ * during collection, so a flag set later cannot skip anything and the suite
+ * fails confusingly on a machine with no MySQL instead of stepping aside.
+ */
+const available = await (async () => {
+  try {
+    await db.raw('SELECT 1');
+    // A fresh checkout has not run migrations yet.
+    await db.migrate.latest();
+    return true;
+  } catch {
+    return false;
+  }
+})();
 
 beforeAll(async () => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-  } catch {
-    available = false;
-    return;
+  if (!available) return;
+
+  // Clean slate. MySQL refuses a TRUNCATE on a table another references, and
+  // DELETE order has to respect the same constraints, so drop the checks for
+  // the reset rather than hand-maintaining a topological order.
+  await db.raw('SET FOREIGN_KEY_CHECKS = 0');
+  for (const table of [
+    'AuditEvent', 'RequirementCitation', 'RequirementRevision', 'ConflictCitation',
+    'Conflict', 'Decision', 'BaselineRequirement', 'ScopeBaseline', 'Requirement',
+    'AiRun', 'SourceFragment', 'Source', 'ProjectMember', 'Project', 'Client', 'User',
+  ]) {
+    await db(table).delete();
   }
+  await db.raw('SET FOREIGN_KEY_CHECKS = 1');
 
-  // Clean slate, respecting foreign keys.
-  await prisma.auditEvent.deleteMany();
-  await prisma.requirementCitation.deleteMany();
-  await prisma.requirementRevision.deleteMany();
-  await prisma.conflictCitation.deleteMany();
-  await prisma.conflict.deleteMany();
-  await prisma.requirement.deleteMany();
-  await prisma.aiRun.deleteMany();
-  await prisma.sourceFragment.deleteMany();
-  await prisma.source.deleteMany();
-  await prisma.projectMember.deleteMany();
-  await prisma.project.deleteMany();
-  await prisma.client.deleteMany();
-  await prisma.user.deleteMany();
-
-  const user = await prisma.user.create({
-    data: { email: 'test-pm@teqdeft.com', name: 'Test PM', role: 'PROJECT_MANAGER', passwordHash: 'x' },
+  userId = newId();
+  await db('User').insert({
+    id: userId, email: 'test-pm@teqdeft.com', name: 'Test PM',
+    role: 'PROJECT_MANAGER', passwordHash: 'x',
   });
-  userId = user.id;
 
-  const client = await prisma.client.create({ data: { name: 'Test Client' } });
-  const project = await prisma.project.create({
-    data: {
-      code: 'TST-01',
-      name: 'Test project',
-      clientId: client.id,
-      engagementType: 'MARKETING_WEBSITE',
-      projectManagerId: user.id,
+  const clientId = newId();
+  await db('Client').insert({ id: clientId, name: 'Test Client' });
+
+  projectId = newId();
+  await db('Project').insert({
+    id: projectId,
+    code: 'TST-01',
+    name: 'Test project',
+    clientId,
+    engagementType: 'MARKETING_WEBSITE',
+    projectManagerId: userId,
+    healthFacts: fromJson([]),
+    intakeChecklist: fromJson({}),
+  });
+
+  const sourceId = newId();
+  await db('Source').insert({
+    id: sourceId,
+    projectId,
+    title: 'Signed proposal',
+    kind: 'PROPOSAL',
+    authority: 'SIGNED_CONTRACT',
+    statedAt: new Date('2026-01-01'),
+    processingState: 'READY',
+    uploadedById: userId,
+    extractedChars: 500,
+  });
+
+  realFragmentIds = [newId(), newId()];
+  await db('SourceFragment').insert([
+    {
+      id: realFragmentIds[0]!, sourceId, ordinal: 0, locator: '¶1',
+      text: 'The website will comprise eight page templates, each delivered responsively.',
+      charStart: 0, charEnd: 76,
     },
-  });
-  projectId = project.id;
-
-  const source = await prisma.source.create({
-    data: {
-      projectId,
-      title: 'Signed proposal',
-      kind: 'PROPOSAL',
-      authority: 'SIGNED_CONTRACT',
-      statedAt: new Date('2026-01-01'),
-      processingState: 'READY',
-      uploadedById: user.id,
-      extractedChars: 500,
-      fragments: {
-        create: [
-          { ordinal: 0, locator: '¶1', text: 'The website will comprise eight page templates, each delivered responsively.', charStart: 0, charEnd: 76 },
-          { ordinal: 1, locator: '¶2', text: 'Hosting and ongoing maintenance are explicitly excluded from this engagement.', charStart: 78, charEnd: 154 },
-        ],
-      },
+    {
+      id: realFragmentIds[1]!, sourceId, ordinal: 1, locator: '¶2',
+      text: 'Hosting and ongoing maintenance are explicitly excluded from this engagement.',
+      charStart: 78, charEnd: 154,
     },
-    include: { fragments: { orderBy: { ordinal: 'asc' } } },
-  });
-  realFragmentIds = source.fragments.map((f) => f.id);
+  ]);
 });
 
 afterAll(async () => {
-  if (available) await prisma.$disconnect();
+  if (available) await closeDb();
 });
 
 const requirement = (overrides: Partial<ExtractionResult['requirements'][number]> = {}) => ({
@@ -134,13 +154,12 @@ describe.skipIf(!available)('extractRequirements', () => {
 
     expect(outcome.requirementsCreated).toBe(1);
 
-    const stored = await prisma.requirement.findFirstOrThrow({
-      where: { projectId, title: 'Eight page templates' },
-      include: { citations: true },
-    });
-    expect(stored.citations).toHaveLength(1);
-    expect(stored.citations[0]!.sourceFragmentId).toBe(realFragmentIds[0]);
-    expect(stored.reference).toMatch(/^REQ-\d{3}$/);
+    const stored = await db('Requirement').where({ projectId, title: 'Eight page templates' }).first();
+    expect(stored).toBeDefined();
+    const citations = await db('RequirementCitation').where({ requirementId: stored!.id });
+    expect(citations).toHaveLength(1);
+    expect(citations[0]!.sourceFragmentId).toBe(realFragmentIds[0]);
+    expect(stored!.reference).toMatch(/^REQ-\d{3}$/);
   });
 
   // The core guarantee. A model that invents a fragment id must not be able to
@@ -161,7 +180,7 @@ describe.skipIf(!available)('extractRequirements', () => {
 
     expect(outcome.requirementsCreated).toBe(0);
     expect(outcome.warnings.join(' ')).toContain('none of its citations could be verified');
-    expect(await prisma.requirement.count({ where: { projectId, title: 'Fabricated requirement' } })).toBe(0);
+    expect(await db('Requirement').where({ projectId, title: 'Fabricated requirement' })).toHaveLength(0);
   });
 
   it('keeps verifiable citations and drops fabricated ones from the same requirement', async () => {
@@ -181,12 +200,10 @@ describe.skipIf(!available)('extractRequirements', () => {
 
     await extractRequirements({ projectId, sourceIds: [], userId });
 
-    const stored = await prisma.requirement.findFirstOrThrow({
-      where: { projectId, title: 'Partly cited requirement' },
-      include: { citations: true },
-    });
-    expect(stored.citations).toHaveLength(1);
-    expect(stored.citations[0]!.sourceFragmentId).toBe(realFragmentIds[1]);
+    const stored = await db('Requirement').where({ projectId, title: 'Partly cited requirement' }).first();
+    const citations = await db('RequirementCitation').where({ requirementId: stored!.id });
+    expect(citations).toHaveLength(1);
+    expect(citations[0]!.sourceFragmentId).toBe(realFragmentIds[1]);
   });
 
   // A paraphrased quote would show the reviewer words the document does not
@@ -205,11 +222,9 @@ describe.skipIf(!available)('extractRequirements', () => {
 
     const outcome = await extractRequirements({ projectId, sourceIds: [], userId });
 
-    const stored = await prisma.requirement.findFirstOrThrow({
-      where: { projectId, title: 'Paraphrased citation' },
-      include: { citations: true },
-    });
-    expect(stored.citations[0]!.quote).toContain('The website will comprise eight page templates');
+    const stored = await db('Requirement').where({ projectId, title: 'Paraphrased citation' }).first();
+    const citations = await db('RequirementCitation').where({ requirementId: stored!.id });
+    expect(citations[0]!.quote).toContain('The website will comprise eight page templates');
     expect(outcome.warnings.join(' ')).toContain('did not match its fragment');
   });
 
@@ -219,21 +234,21 @@ describe.skipIf(!available)('extractRequirements', () => {
 
     await extractRequirements({ projectId, sourceIds: [], userId });
 
-    const stored = await prisma.requirement.findFirstOrThrow({ where: { projectId, title: 'Should still be a draft' } });
-    expect(stored.reviewState).toBe('DRAFT');
-    expect(stored.origin).toBe('AI_EXTRACTION');
+    const stored = await db('Requirement').where({ projectId, title: 'Should still be a draft' }).first();
+    expect(stored!.reviewState).toBe('DRAFT');
+    expect(stored!.origin).toBe('AI_EXTRACTION');
   });
 
   it('rejects output that does not match the schema, and writes nothing', async () => {
-    const before = await prisma.requirement.count({ where: { projectId } });
+    const before = (await db('Requirement').where({ projectId })).length;
     // A requirement with no citations array at all.
     stubbedResult = { requirements: [{ title: 'Bad' } as never], conflicts: [], gaps: [] };
 
     await expect(extractRequirements({ projectId, sourceIds: [], userId })).rejects.toThrow(/schema/i);
 
-    expect(await prisma.requirement.count({ where: { projectId } })).toBe(before);
-    const run = await prisma.aiRun.findFirstOrThrow({ where: { projectId }, orderBy: { createdAt: 'desc' } });
-    expect(run.state).toBe('FAILED');
+    expect((await db('Requirement').where({ projectId })).length).toBe(before);
+    const run = await db('AiRun').where({ projectId }).orderBy('createdAt', 'desc').first();
+    expect(run!.state).toBe('FAILED');
   });
 
   it('drops a conflict whose evidence cannot be resolved', async () => {
@@ -264,37 +279,37 @@ describe.skipIf(!available)('extractRequirements', () => {
 
     const outcome = await extractRequirements({ projectId, sourceIds: [], userId });
 
-    const run = await prisma.aiRun.findUniqueOrThrow({ where: { id: outcome.runId } });
-    expect(run.promptVersion).toBe('extraction.v1');
-    expect(run.schemaVersion).toBe('extraction.v1');
-    expect(run.provider).toBe('ANTHROPIC');
-    expect(run.state).toBe('AWAITING_REVIEW');
-    expect(run.inputTokens).toBe(1000);
-    expect(Number(run.costUsd)).toBeCloseTo(0.0175, 4);
-    expect((run.inputSourceIds as string[]).length).toBeGreaterThan(0);
+    const run = await db('AiRun').where({ id: outcome.runId }).first();
+    expect(run!.promptVersion).toBe('extraction.v1');
+    expect(run!.schemaVersion).toBe('extraction.v1');
+    expect(run!.provider).toBe('ANTHROPIC');
+    expect(run!.state).toBe('AWAITING_REVIEW');
+    expect(run!.inputTokens).toBe(1000);
+    expect(toNumber(run!.costUsd)).toBeCloseTo(0.0175, 4);
+    expect((run!.inputSourceIds as string[]).length).toBeGreaterThan(0);
 
-    const audit = await prisma.auditEvent.findFirstOrThrow({
-      where: { projectId, action: 'ai.extraction_completed' },
-      orderBy: { createdAt: 'desc' },
-    });
-    expect(audit.actorId).toBe(userId);
-    expect(audit.entityId).toBe(outcome.runId);
+    const audit = await db('AuditEvent')
+      .where({ projectId, action: 'ai.extraction_completed' })
+      .orderBy('createdAt', 'desc')
+      .first();
+    expect(audit!.actorId).toBe(userId);
+    expect(audit!.entityId).toBe(outcome.runId);
   });
 
   // §16.1: a project can be barred from external AI processing entirely.
   it('refuses to run when the project has external AI disabled', async () => {
-    await prisma.project.update({ where: { id: projectId }, data: { externalAiEnabled: false } });
+    await db('Project').where({ id: projectId }).update({ externalAiEnabled: 0 });
 
     await expect(extractRequirements({ projectId, sourceIds: [], userId })).rejects.toThrow(/disabled for this project/i);
 
-    await prisma.project.update({ where: { id: projectId }, data: { externalAiEnabled: true } });
+    await db('Project').where({ id: projectId }).update({ externalAiEnabled: 1 });
   });
 
   it('refuses to send a source marked Restricted', async () => {
-    await prisma.source.updateMany({ where: { projectId }, data: { confidentiality: 'RESTRICTED' } });
+    await db('Source').where({ projectId }).update({ confidentiality: 'RESTRICTED' });
 
     await expect(extractRequirements({ projectId, sourceIds: [], userId })).rejects.toThrow(/No analysable sources/i);
 
-    await prisma.source.updateMany({ where: { projectId }, data: { confidentiality: 'STANDARD' } });
+    await db('Source').where({ projectId }).update({ confidentiality: 'STANDARD' });
   });
 });

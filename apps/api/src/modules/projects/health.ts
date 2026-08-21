@@ -1,5 +1,4 @@
-import type { Prisma } from '@prisma/client';
-import { prisma } from '../../db.js';
+import { db, countRows, firstOrThrow, fromJson, toDate } from '../../db/index.js';
 
 export interface HealthFact {
   rule: string;
@@ -25,37 +24,52 @@ export interface HealthResult {
 export async function computeProjectHealth(projectId: string): Promise<HealthResult> {
   const now = new Date();
 
-  const [project, overdueMilestones, openBlockers, unresolvedConflicts, openQuestions, highRisks, staleness] =
+  const [projectRow, approvedBaseline, overdueMilestones, openBlockers, unresolvedConflicts, openQuestions, highRisks, staleness] =
     await Promise.all([
-      prisma.project.findUniqueOrThrow({
-        where: { id: projectId },
-        select: { stage: true, targetLaunchDate: true, updatedAt: true, baselines: { where: { state: 'APPROVED' }, select: { id: true }, take: 1 } },
-      }),
-      prisma.milestone.findMany({
-        where: { projectId, actualDate: null, targetDate: { lt: now } },
-        select: { name: true, targetDate: true },
-      }),
-      prisma.risk.findMany({
-        where: { projectId, kind: 'BLOCKER', state: { in: ['OPEN', 'ESCALATED'] } },
-        select: { title: true, createdAt: true, severity: true },
-      }),
-      prisma.conflict.count({ where: { projectId, state: 'OPEN' } }),
-      prisma.requirement.count({
-        where: { projectId, openQuestion: { not: null }, questionAnsweredAt: null, reviewState: { not: 'REJECTED' } },
-      }),
-      prisma.risk.count({
-        where: { projectId, kind: 'RISK', state: { in: ['OPEN', 'ESCALATED'] }, severity: { in: ['HIGH', 'CRITICAL'] } },
-      }),
-      prisma.workItem.count({
-        where: { projectId, status: 'BLOCKED' },
-      }),
+      firstOrThrow(
+        db('Project').select('stage', 'targetLaunchDate', 'updatedAt').where({ id: projectId }).first(),
+        'Project',
+      ),
+      db('ScopeBaseline').select('id').where({ projectId, state: 'APPROVED' }).first(),
+      db('Milestone')
+        .select('name', 'targetDate')
+        .where({ projectId })
+        .whereNull('actualDate')
+        .where('targetDate', '<', now),
+      db('Risk')
+        .select('title', 'createdAt', 'severity')
+        .where({ projectId, kind: 'BLOCKER' })
+        .whereIn('state', ['OPEN', 'ESCALATED']),
+      countRows(db('Conflict').where({ projectId, state: 'OPEN' })),
+      countRows(
+        db('Requirement')
+          .where({ projectId })
+          .whereNotNull('openQuestion')
+          .whereNull('questionAnsweredAt')
+          .whereNot('reviewState', 'REJECTED'),
+      ),
+      countRows(
+        db('Risk')
+          .where({ projectId, kind: 'RISK' })
+          .whereIn('state', ['OPEN', 'ESCALATED'])
+          .whereIn('severity', ['HIGH', 'CRITICAL']),
+      ),
+      countRows(db('WorkItem').where({ projectId, status: 'BLOCKED' })),
     ]);
+
+  const project = {
+    stage: projectRow.stage,
+    targetLaunchDate: toDate(projectRow.targetLaunchDate),
+    updatedAt: toDate(projectRow.updatedAt) ?? now,
+    baselines: approvedBaseline ? [approvedBaseline] : [],
+  };
 
   const facts: HealthFact[] = [];
   let score = 0;
 
   for (const m of overdueMilestones) {
-    const days = Math.floor((now.getTime() - (m.targetDate?.getTime() ?? now.getTime())) / 86_400_000);
+    const target = toDate(m.targetDate);
+    const days = Math.floor((now.getTime() - (target?.getTime() ?? now.getTime())) / 86_400_000);
     facts.push({
       rule: 'milestone.overdue',
       label: 'Milestone overdue',
@@ -67,7 +81,7 @@ export async function computeProjectHealth(projectId: string): Promise<HealthRes
   }
 
   for (const b of openBlockers) {
-    const age = Math.floor((now.getTime() - b.createdAt.getTime()) / 86_400_000);
+    const age = Math.floor((now.getTime() - (toDate(b.createdAt)?.getTime() ?? now.getTime())) / 86_400_000);
     const points = age > 3 ? 25 : 12;
     facts.push({
       rule: 'blocker.open',
@@ -207,13 +221,22 @@ export async function computeProjectHealth(projectId: string): Promise<HealthRes
 /** Recomputes and persists. Called after any change that could move health. */
 export async function refreshProjectHealth(projectId: string): Promise<HealthResult> {
   const result = await computeProjectHealth(projectId);
-  await prisma.project.update({
-    where: { id: projectId },
-    data: {
+  await db('Project')
+    .where({ id: projectId })
+    .update({
       health: result.health,
-      healthFacts: result.facts as unknown as Prisma.InputJsonValue,
+      healthFacts: fromJson(result.facts),
       healthComputedAt: new Date(),
-    },
-  });
+      // Assigning updatedAt to itself suppresses MySQL's ON UPDATE clause and
+      // keeps the column meaning "when the project last actually changed".
+      //
+      // Writing derived health back is not project activity. Without this the
+      // column records the last health computation instead, `daysSinceUpdate`
+      // is always ~0, and the GREY "insufficient current data" rule in §13.1
+      // can never fire — a silent project would keep reporting green forever.
+      // The PostgreSQL original had the same defect through Prisma's
+      // @updatedAt; it is fixed here rather than carried across.
+      updatedAt: db.ref('updatedAt') as never,
+    });
   return result;
 }

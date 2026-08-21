@@ -7,8 +7,23 @@ import {
   updateProjectBody,
   addMemberBody,
 } from '@deliveryos/shared';
-import type { Prisma } from '@prisma/client';
-import { prisma } from '../../db.js';
+import {
+  db,
+  transaction,
+  countRows,
+  defined,
+  fromBool,
+  fromJson,
+  indexBy,
+  insertReturning,
+  likeContains,
+  newId,
+  paginateQuery,
+  toBool,
+  toDecimalString,
+  toJson,
+  type ProjectRow,
+} from '../../db/index.js';
 import { requireUser } from '../../lib/auth.js';
 import { paginate, parseBody, parseQuery, route } from '../../lib/http.js';
 import { projectScope, redactCommercial, requireCapability, requireProjectAccess, can } from '../../lib/rbac.js';
@@ -18,49 +33,102 @@ import { refreshProjectHealth } from './health.js';
 
 export const projectsRouter = Router();
 
+/**
+ * Shapes a Project row the way the API has always returned it. Booleans come
+ * back from MySQL as 0/1 and JSON columns may arrive as text, so normalising
+ * here keeps every caller — and the web app — unchanged.
+ */
+function presentProject(row: ProjectRow) {
+  return {
+    ...row,
+    externalAiEnabled: toBool(row.externalAiEnabled),
+    // MySQL renders DECIMAL(14,2) as "850000.00" where the API has always
+    // returned "850000". Same number, different bytes.
+    contractValue: toDecimalString(row.contractValue),
+    healthFacts: toJson(row.healthFacts, [] as unknown[]),
+    intakeChecklist: toJson(row.intakeChecklist, {} as Record<string, unknown>),
+  };
+}
+
 projectsRouter.get(
   '/',
   route(async (req, res) => {
     const user = requireUser(req);
     const q = parseQuery(projectListQuery, req.query);
 
-    const where: Prisma.ProjectWhereInput = {
-      ...projectScope(user),
-      archivedAt: null,
-      ...(q.stage ? { stage: q.stage } : {}),
-      ...(q.health ? { health: q.health } : {}),
-      ...(q.engagementType ? { engagementType: q.engagementType } : {}),
-      ...(q.clientId ? { clientId: q.clientId } : {}),
-      ...(q.projectManagerId ? { projectManagerId: q.projectManagerId } : {}),
-      ...(q.search
-        ? {
-            OR: [
-              { name: { contains: q.search, mode: 'insensitive' } },
-              { code: { contains: q.search, mode: 'insensitive' } },
-              { client: { name: { contains: q.search, mode: 'insensitive' } } },
-            ],
-          }
-        : {}),
-    };
+    const base = projectScope(user)(db('Project').whereNull('Project.archivedAt'));
 
-    const [rows, total] = await Promise.all([
-      prisma.project.findMany({
-        where,
-        orderBy: [{ health: 'asc' }, { targetLaunchDate: 'asc' }, { createdAt: 'desc' }],
-        skip: (q.page - 1) * q.pageSize,
-        take: q.pageSize,
-        include: {
-          client: { select: { id: true, name: true } },
-          projectManager: { select: { id: true, name: true, avatarColor: true } },
-          _count: { select: { requirements: true, sources: true, workItems: true } },
-        },
-      }),
-      prisma.project.count({ where }),
-    ]);
+    if (q.stage) base.where('Project.stage', q.stage);
+    if (q.health) base.where('Project.health', q.health);
+    if (q.engagementType) base.where('Project.engagementType', q.engagementType);
+    if (q.clientId) base.where('Project.clientId', q.clientId);
+    if (q.projectManagerId) base.where('Project.projectManagerId', q.projectManagerId);
+    if (q.search) {
+      // The schema uses a case-insensitive collation, so LIKE matches the way
+      // Prisma's `mode: 'insensitive'` did on PostgreSQL.
+      const term = likeContains(q.search);
+      base.where((w) =>
+        w
+          .where('Project.name', 'like', term)
+          .orWhere('Project.code', 'like', term)
+          .orWhereIn('Project.clientId', (sub) =>
+            sub.select('id').from('Client').where('name', 'like', term),
+          ),
+      );
+    }
 
-    res.json(paginate(rows.map((p) => redactCommercial(user, p)), total, q.page, q.pageSize));
+    const listed = base
+      .clone()
+      .select('Project.*')
+      .orderBy([
+        // Ordering by the enum's declaration order puts GREEN first, exactly as
+        // the PostgreSQL enum ordering did.
+        { column: 'Project.health', order: 'asc' },
+        { column: 'Project.targetLaunchDate', order: 'asc' },
+        { column: 'Project.createdAt', order: 'desc' },
+      ]);
+
+    const { items: rows, total } = await paginateQuery<ProjectRow>(listed, q.page, q.pageSize);
+
+    const projects = await attachProjectRelations(rows);
+    res.json(paginate(projects.map((p) => redactCommercial(user, p)), total, q.page, q.pageSize));
   }),
 );
+
+/** One extra query per relation for the whole page, rather than one per row. */
+async function attachProjectRelations(rows: ProjectRow[]) {
+  if (rows.length === 0) return [];
+  const projectIds = rows.map((r) => r.id);
+
+  const [clients, people, requirementCounts, sourceCounts, workItemCounts] = await Promise.all([
+    db('Client').select('id', 'name').whereIn('id', rows.map((r) => r.clientId)),
+    db('User')
+      .select('id', 'name', 'avatarColor')
+      .whereIn('id', rows.map((r) => r.projectManagerId)),
+    db('Requirement').select('projectId').count({ n: '*' }).whereIn('projectId', projectIds).groupBy('projectId'),
+    db('Source').select('projectId').count({ n: '*' }).whereIn('projectId', projectIds).groupBy('projectId'),
+    db('WorkItem').select('projectId').count({ n: '*' }).whereIn('projectId', projectIds).groupBy('projectId'),
+  ]);
+
+  const clientById = indexBy(clients, 'id');
+  const personById = indexBy(people, 'id');
+  const tally = (list: { projectId: string; n: number | string }[]) =>
+    new Map(list.map((r) => [r.projectId, Number(r.n)]));
+  const reqs = tally(requirementCounts as never);
+  const srcs = tally(sourceCounts as never);
+  const items = tally(workItemCounts as never);
+
+  return rows.map((row) => ({
+    ...presentProject(row),
+    client: clientById.get(row.clientId) ?? null,
+    projectManager: personById.get(row.projectManagerId) ?? null,
+    _count: {
+      requirements: reqs.get(row.id) ?? 0,
+      sources: srcs.get(row.id) ?? 0,
+      workItems: items.get(row.id) ?? 0,
+    },
+  }));
+}
 
 projectsRouter.post(
   '/',
@@ -70,50 +138,52 @@ projectsRouter.post(
     const body = parseBody(createProjectBody, req.body);
 
     const [client, pm, existing] = await Promise.all([
-      prisma.client.findUnique({ where: { id: body.clientId }, select: { id: true, name: true } }),
-      prisma.user.findUnique({ where: { id: body.projectManagerId }, select: { id: true, isActive: true } }),
-      prisma.project.findUnique({ where: { code: body.code }, select: { id: true } }),
+      db('Client').select('id', 'name').where({ id: body.clientId }).first(),
+      db('User').select('id', 'isActive').where({ id: body.projectManagerId }).first(),
+      db('Project').select('id').where({ code: body.code }).first(),
     ]);
 
     if (!client) throw notFound('Client');
-    if (!pm?.isActive) throw badRequest('The nominated project manager is not an active user');
+    if (!pm || !toBool(pm.isActive)) throw badRequest('The nominated project manager is not an active user');
     if (existing) throw conflict(`Project code ${body.code} is already in use`);
 
-    const project = await prisma.$transaction(async (tx) => {
-      const created = await tx.project.create({
-        data: {
-          code: body.code,
-          name: body.name,
-          summary: body.summary || null,
-          clientId: body.clientId,
-          engagementType: body.engagementType,
-          confidentiality: body.confidentiality,
-          projectManagerId: body.projectManagerId,
-          technicalLeadId: body.technicalLeadId || null,
-          startDate: body.startDate ?? null,
-          targetLaunchDate: body.targetLaunchDate ?? null,
-          contractValue: body.contractValue ?? null,
-          currency: body.currency,
-          externalAiEnabled: body.externalAiEnabled,
-          // Every checklist item starts explicitly false rather than absent, so
-          // "not yet done" and "nobody has looked" read the same in the UI.
-          intakeChecklist: Object.fromEntries(
-            INTAKE_CHECKLIST_ITEMS.map((i) => [i.key, { done: false, note: null }]),
-          ) as Prisma.InputJsonValue,
-        },
+    const project = await transaction(async (tx) => {
+      const created = await insertReturning(tx, 'Project', {
+        id: newId(),
+        code: body.code,
+        name: body.name,
+        summary: body.summary || null,
+        clientId: body.clientId,
+        engagementType: body.engagementType,
+        confidentiality: body.confidentiality,
+        projectManagerId: body.projectManagerId,
+        technicalLeadId: body.technicalLeadId || null,
+        startDate: body.startDate ?? null,
+        targetLaunchDate: body.targetLaunchDate ?? null,
+        contractValue: body.contractValue?.toString() ?? null,
+        currency: body.currency,
+        externalAiEnabled: fromBool(body.externalAiEnabled),
+        healthFacts: fromJson([]),
+        // Every checklist item starts explicitly false rather than absent, so
+        // "not yet done" and "nobody has looked" read the same in the UI.
+        intakeChecklist: fromJson(
+          Object.fromEntries(INTAKE_CHECKLIST_ITEMS.map((i) => [i.key, { done: false, note: null }])),
+        ),
       });
 
       // The PM and tech lead are members by construction; forgetting to add
       // them would lock the owners out of their own project.
-      const memberIds = [body.projectManagerId, body.technicalLeadId].filter(Boolean) as string[];
-      await tx.projectMember.createMany({
-        data: [...new Set(memberIds)].map((userId) => ({
-          projectId: created.id,
-          userId,
-          projectRole: userId === body.projectManagerId ? 'PROJECT_MANAGER' : 'CTO',
-        })),
-        skipDuplicates: true,
-      });
+      const memberIds = [...new Set([body.projectManagerId, body.technicalLeadId].filter(Boolean) as string[])];
+      if (memberIds.length > 0) {
+        await tx('ProjectMember').insert(
+          memberIds.map((userId) => ({
+            id: newId(),
+            projectId: created.id,
+            userId,
+            projectRole: userId === body.projectManagerId ? ('PROJECT_MANAGER' as const) : ('CTO' as const),
+          })),
+        );
+      }
 
       await recordAudit(
         {
@@ -132,7 +202,7 @@ projectsRouter.post(
       return created;
     });
 
-    res.status(201).json({ project: redactCommercial(user, project) });
+    res.status(201).json({ project: redactCommercial(user, presentProject(project)) });
   }),
 );
 
@@ -142,40 +212,46 @@ projectsRouter.get(
     const user = requireUser(req);
     const project = await requireProjectAccess(user, req.params.projectId);
 
-    const [counts, activeBaseline, latestRun] = await Promise.all([
-      Promise.all([
-        prisma.source.count({ where: { projectId: project.id } }),
-        prisma.requirement.count({ where: { projectId: project.id, reviewState: { not: 'SUPERSEDED' } } }),
-        prisma.requirement.count({ where: { projectId: project.id, reviewState: 'APPROVED' } }),
-        prisma.requirement.count({
-          where: { projectId: project.id, openQuestion: { not: null }, questionAnsweredAt: null },
-        }),
-        prisma.conflict.count({ where: { projectId: project.id, state: 'OPEN' } }),
-        prisma.workItem.count({ where: { projectId: project.id } }),
-      ]).then(([sources, requirements, approvedRequirements, openQuestions, openConflicts, workItems]) => ({
-        sources,
-        requirements,
-        approvedRequirements,
-        openQuestions,
-        openConflicts,
-        workItems,
-      })),
-      prisma.scopeBaseline.findFirst({
-        where: { projectId: project.id, state: 'APPROVED' },
-        orderBy: { version: 'desc' },
-        select: { id: true, version: true, title: true, approvedAt: true, _count: { select: { requirements: true } } },
-      }),
-      prisma.aiRun.findFirst({
-        where: { projectId: project.id },
-        orderBy: { createdAt: 'desc' },
-        select: { id: true, jobType: true, state: true, createdAt: true, producedCount: true },
-      }),
+    const [
+      sources, requirements, approvedRequirements, openQuestions, openConflicts, workItems,
+      activeBaseline, latestRun,
+    ] = await Promise.all([
+      countRows(db('Source').where({ projectId: project.id })),
+      countRows(db('Requirement').where({ projectId: project.id }).whereNot('reviewState', 'SUPERSEDED')),
+      countRows(db('Requirement').where({ projectId: project.id, reviewState: 'APPROVED' })),
+      countRows(
+        db('Requirement')
+          .where({ projectId: project.id })
+          .whereNotNull('openQuestion')
+          .whereNull('questionAnsweredAt'),
+      ),
+      countRows(db('Conflict').where({ projectId: project.id, state: 'OPEN' })),
+      countRows(db('WorkItem').where({ projectId: project.id })),
+      db('ScopeBaseline')
+        .select('id', 'version', 'title', 'approvedAt')
+        .where({ projectId: project.id, state: 'APPROVED' })
+        .orderBy('version', 'desc')
+        .first(),
+      db('AiRun')
+        .select('id', 'jobType', 'state', 'createdAt', 'producedCount')
+        .where({ projectId: project.id })
+        .orderBy('createdAt', 'desc')
+        .first(),
     ]);
 
+    const baselineWithCount = activeBaseline
+      ? {
+          ...activeBaseline,
+          _count: {
+            requirements: await countRows(db('BaselineRequirement').where({ baselineId: activeBaseline.id })),
+          },
+        }
+      : null;
+
     res.json({
-      project: redactCommercial(user, project),
-      counts,
-      activeBaseline,
+      project: redactCommercial(user, presentProject(project as ProjectRow)),
+      counts: { sources, requirements, approvedRequirements, openQuestions, openConflicts, workItems },
+      activeBaseline: baselineWithCount,
       latestRun,
       checklist: INTAKE_CHECKLIST_ITEMS,
       canEdit: can(user, 'project.update'),
@@ -193,12 +269,19 @@ projectsRouter.patch(
 
     const changes = diffFields(existing as unknown as Record<string, unknown>, body as Record<string, unknown>);
     if (Object.keys(changes).length === 0) {
-      res.json({ project: redactCommercial(user, existing) });
+      res.json({ project: redactCommercial(user, presentProject(existing as ProjectRow)) });
       return;
     }
 
-    const project = await prisma.$transaction(async (tx) => {
-      const updated = await tx.project.update({ where: { id: existing.id }, data: body });
+    const project = await transaction(async (tx) => {
+      const patch = defined({
+        ...body,
+        contractValue: body.contractValue === undefined ? undefined : (body.contractValue?.toString() ?? null),
+        externalAiEnabled: body.externalAiEnabled === undefined ? undefined : fromBool(body.externalAiEnabled),
+      });
+      await tx('Project').where({ id: existing.id }).update(patch as never);
+      const updated = await tx('Project').where({ id: existing.id }).first();
+
       await recordAudit(
         {
           projectId: existing.id,
@@ -212,10 +295,10 @@ projectsRouter.patch(
         },
         tx,
       );
-      return updated;
+      return updated!;
     });
 
-    res.json({ project: redactCommercial(user, project) });
+    res.json({ project: redactCommercial(user, presentProject(project)) });
   }),
 );
 
@@ -228,7 +311,7 @@ projectsRouter.patch(
     const project = await requireProjectAccess(user, req.params.projectId);
     const body = parseBody(updateIntakeChecklistBody, req.body);
 
-    const checklist = { ...((project.intakeChecklist as Record<string, unknown>) ?? {}) };
+    const checklist = { ...toJson(project.intakeChecklist, {} as Record<string, unknown>) };
     checklist[body.key] = {
       done: body.done,
       note: body.note ?? null,
@@ -236,11 +319,8 @@ projectsRouter.patch(
       at: new Date().toISOString(),
     };
 
-    await prisma.$transaction(async (tx) => {
-      await tx.project.update({
-        where: { id: project.id },
-        data: { intakeChecklist: checklist as Prisma.InputJsonValue },
-      });
+    await transaction(async (tx) => {
+      await tx('Project').where({ id: project.id }).update({ intakeChecklist: fromJson(checklist) });
       await recordAudit(
         {
           projectId: project.id,
@@ -277,12 +357,37 @@ projectsRouter.get(
   route(async (req, res) => {
     const user = requireUser(req);
     const project = await requireProjectAccess(user, req.params.projectId);
-    const members = await prisma.projectMember.findMany({
-      where: { projectId: project.id },
-      include: { user: { select: { id: true, name: true, email: true, role: true, avatarColor: true } } },
-      orderBy: { addedAt: 'asc' },
+
+    const members = await db('ProjectMember')
+      .select(
+        'ProjectMember.id',
+        'ProjectMember.projectId',
+        'ProjectMember.userId',
+        'ProjectMember.projectRole',
+        'ProjectMember.addedAt',
+        'User.id as user_id',
+        'User.name as user_name',
+        'User.email as user_email',
+        'User.role as user_role',
+        'User.avatarColor as user_avatarColor',
+      )
+      .join('User', 'User.id', 'ProjectMember.userId')
+      .where('ProjectMember.projectId', project.id)
+      .orderBy('ProjectMember.addedAt', 'asc');
+
+    res.json({
+      members: members.map((m: Record<string, unknown>) => ({
+        id: m.id,
+        projectId: m.projectId,
+        userId: m.userId,
+        projectRole: m.projectRole,
+        addedAt: m.addedAt,
+        user: {
+          id: m.user_id, name: m.user_name, email: m.user_email,
+          role: m.user_role, avatarColor: m.user_avatarColor,
+        },
+      })),
     });
-    res.json({ members });
   }),
 );
 
@@ -294,32 +399,57 @@ projectsRouter.post(
     const project = await requireProjectAccess(user, req.params.projectId);
     const body = parseBody(addMemberBody, req.body);
 
-    const target = await prisma.user.findUnique({
-      where: { id: body.userId },
-      select: { id: true, name: true, isActive: true },
-    });
-    if (!target?.isActive) throw badRequest('That user is not active');
+    const target = await db('User')
+      .select('id', 'name', 'email', 'role', 'avatarColor', 'isActive')
+      .where({ id: body.userId })
+      .first();
+    if (!target || !toBool(target.isActive)) throw badRequest('That user is not active');
 
-    const member = await prisma.$transaction(async (tx) => {
-      const created = await tx.projectMember.upsert({
-        where: { projectId_userId: { projectId: project.id, userId: body.userId } },
-        create: { projectId: project.id, userId: body.userId, projectRole: body.projectRole },
-        update: { projectRole: body.projectRole },
-        include: { user: { select: { id: true, name: true, email: true, role: true, avatarColor: true } } },
-      });
+    const member = await transaction(async (tx) => {
+      const existing = await tx('ProjectMember')
+        .where({ projectId: project.id, userId: body.userId })
+        .first();
+
+      // MySQL has no upsert-with-returning; the read-then-write is inside the
+      // transaction so a concurrent add cannot slip between them.
+      if (existing) {
+        await tx('ProjectMember').where({ id: existing.id }).update({ projectRole: body.projectRole });
+      } else {
+        await tx('ProjectMember').insert({
+          id: newId(),
+          projectId: project.id,
+          userId: body.userId,
+          projectRole: body.projectRole,
+        });
+      }
+
+      const row = await tx('ProjectMember')
+        .where({ projectId: project.id, userId: body.userId })
+        .first();
+
       await recordAudit(
         {
           projectId: project.id,
           actorId: user.id,
           action: 'project.member_added',
           entityType: 'ProjectMember',
-          entityId: created.id,
+          entityId: row!.id,
           summary: `${user.name} added ${target.name} as ${body.projectRole}`,
           request: req,
         },
         tx,
       );
-      return created;
+
+      return {
+        ...row!,
+        user: {
+          id: target.id,
+          name: target.name,
+          email: target.email,
+          role: target.role,
+          avatarColor: target.avatarColor,
+        },
+      };
     });
 
     res.status(201).json({ member });

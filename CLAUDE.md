@@ -27,7 +27,7 @@ Concretely, these invariants are enforced in code and must stay enforced:
 ## Conventions
 
 - **Vocabulary lives in `packages/shared`.** One spelling for an enum value
-  across Prisma, the API, the wire and the UI. Do not invent a second.
+  across the database, the API, the wire and the UI. Do not invent a second.
 - **Errors are typed.** Throw `badRequest`/`forbidden`/`notFound`/`gateFailed`
   from `lib/errors.ts`. `gateFailed` (422) means "understood and permitted, but
   its preconditions fail" — that is the code a refused approval gate returns.
@@ -36,11 +36,41 @@ Concretely, these invariants are enforced in code and must stay enforced:
 - **Comments explain why, not what.** The existing comments cite blueprint
   sections; keep that when the reason comes from the spec.
 
+## Working with the database
+
+MySQL 8 through Knex. There is no ORM and no generated client — `src/db/` is
+the whole data layer.
+
+- **`db/tables.ts` is the type safety.** Every table's row shape is declared
+  there and registered with Knex, so `db('Project').where({ stag: 'X' })` is a
+  compile error. When you add or change a column, update the row type in the
+  same commit as the migration — nothing regenerates it for you.
+- **Migrations are an explicit list.** Add each new file to the array in
+  `db/migrations/index.ts`. Knex's directory scanning is deliberately not used:
+  it resolves `.ts` in development and `.js` in the build, and finds nothing at
+  all under the test runner, which fails as "table doesn't exist" much later.
+- **Never rename or reorder an applied migration.** The name is the primary key
+  in `knex_migrations`; renaming one makes it run again.
+- **Use the helpers in `db/marshal.ts`.** MySQL differs from PostgreSQL in
+  three ways that are silent rather than loud:
+  `TINYINT(1)` booleans arrive as `0`/`1` (`toBool`), `DECIMAL` arrives as a
+  string and must render the way the API always has (`toDecimalString`), and
+  `LIKE` needs `%`/`_` escaped (`likeContains`).
+- **JSON columns take a string.** Write them through `fromJson()`; passing a
+  bare object stores `"[object Object]"`.
+- **MySQL has no `RETURNING`.** Use `insertReturning` / `updateReturning`; they
+  generate the id up front so the read back is exact.
+- **Load relations in one query per relation**, not one per row —
+  `groupBy`/`indexBy` in `db/helpers.ts` are what replaced Prisma's `include`.
+
 ## Adding an AI job
 
-1. Add the job type to `AI_JOB_TYPES` (shared) and the Prisma enum.
+1. Add the job type to `AI_JOB_TYPES` (shared) and to `db/enums.ts`.
 2. Define its output schema in `packages/shared/src/schemas/` using `.nullable()`
    rather than `.optional()` — OpenAI strict mode requires every field present.
+   Add the job type to `db/enums.ts` too, and write a migration to extend the
+   `AiJobType` column: it is a real MySQL ENUM, so an unknown value is rejected
+   by the database rather than quietly stored.
 3. Add a `ModelPolicy` row for both providers in `ai/model-policy.ts`.
 4. Write the prompt in `ai/prompts.ts` with a version constant, and bump the
    version whenever the wording changes.
@@ -50,7 +80,10 @@ Concretely, these invariants are enforced in code and must stay enforced:
 
 ## Testing
 
-`npm test` for units. `python3 apps/api/scripts/smoke.py` for the end-to-end
+`npm test` for units, including an integration suite that runs the extraction
+pipeline against a real MySQL database with the model stubbed. Those tests skip
+themselves when MySQL is unreachable rather than failing.
+`python3 apps/api/scripts/smoke.py` for the end-to-end
 suite — it needs the API running and the database seeded, and it is the fastest
 way to know whether a change broke a gate.
 
@@ -59,8 +92,11 @@ readable as a list of the product's promises.
 
 ## Gotchas found the hard way
 
-- `prisma.config.ts` disables Prisma's automatic `.env` loading. Both it and
-  `prisma/seed.ts` import `dotenv/config` explicitly. Don't remove those.
+- Anything run outside the server — the migration runner, the seed — imports
+  `dotenv/config` itself. Don't remove those imports or they lose the database
+  configuration.
+- MySQL's first container boot initialises its data directory and is much
+  slower than Postgres's. `setup.sh` waits up to 90 seconds for a reason.
 - The workspace pins a single `vite` via `overrides` in the root
   `package.json`. Two copies produce unrelated TypeScript plugin types and the
   web build stops typechecking.

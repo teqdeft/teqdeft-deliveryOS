@@ -1,29 +1,36 @@
 # The database only. The app itself runs on your machine via `npm run dev`,
 # so you keep hot reload and normal debugging.
 #
-#   docker compose up -d      start Postgres
+#   docker compose up -d      start MySQL
 #   docker compose down       stop it (data is kept)
 #   docker compose down -v    stop it and delete the data
 services:
   db:
-    image: postgres:16
+    image: mysql:8.0
     container_name: deliveryos-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: deliveryos
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: deliveryos
+      MYSQL_USER: deliveryos
+      MYSQL_PASSWORD: deliveryos
+    command:
+      # utf8mb4 end to end. Source fragments carry pilcrows and em-dashes, and
+      # anything narrower mangles them silently.
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
     ports:
-      - '5432:5432'
+      - '3306:3306'
     volumes:
-      - deliveryos-pgdata:/var/lib/postgresql/data
+      - deliveryos-mysqldata:/var/lib/mysql
     healthcheck:
-      # Compose waits for this before reporting the service healthy, so a
-      # setup script does not race the database's first boot.
-      test: ['CMD-SHELL', 'pg_isready -U postgres -d deliveryos']
-      interval: 3s
-      timeout: 3s
-      retries: 20
+      # Compose waits for this, so a setup script does not race MySQL's first
+      # boot — which takes appreciably longer than Postgres's.
+      test: ['CMD', 'mysqladmin', 'ping', '-h', '127.0.0.1', '-u', 'root', '-proot']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
 
 volumes:
-  deliveryos-pgdata:
+  deliveryos-mysqldata:

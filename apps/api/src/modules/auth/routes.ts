@@ -1,9 +1,10 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import { loginBody, registerBody } from '@deliveryos/shared';
-import { prisma } from '../../db.js';
+import { db, fromBool, insertReturning, newId, toBool, toDecimalString } from '../../db/index.js';
 import { authenticate, clearSessionCookie, hashPassword, requireUser, setSessionCookie, signToken, verifyPassword } from '../../lib/auth.js';
 import { parseBody, route } from '../../lib/http.js';
+import { firstOrThrow } from '../../db/index.js';
 import { unauthorized, conflict } from '../../lib/errors.js';
 import { recordAudit } from '../../lib/audit.js';
 import { capabilitiesFor, requireCapability } from '../../lib/rbac.js';
@@ -54,7 +55,7 @@ authRouter.post(
   route(async (req, res) => {
     const body = parseBody(loginBody, req.body);
 
-    const user = await prisma.user.findUnique({ where: { email: body.email.toLowerCase() } });
+    const user = await db('User').where({ email: body.email.toLowerCase() }).first();
 
     // Same message and roughly the same work for "no such user" and "wrong
     // password", so the response cannot be used to enumerate accounts.
@@ -64,12 +65,12 @@ authRouter.post(
     }
     const ok = await verifyPassword(body.password, user.passwordHash);
     if (!ok) throw unauthorized('Email or password is incorrect');
-    if (!user.isActive) throw unauthorized('This account is no longer active');
+    if (!toBool(user.isActive)) throw unauthorized('This account is no longer active');
 
     const token = signToken({ id: user.id, email: user.email, name: user.name, role: user.role });
     setSessionCookie(res, token);
 
-    await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
+    await db('User').where({ id: user.id }).update({ lastLoginAt: new Date() });
     await recordAudit({
       actorId: user.id,
       action: 'auth.signed_in',
@@ -107,14 +108,17 @@ authRouter.get(
   authenticate,
   route(async (req, res) => {
     const auth = requireUser(req);
-    const user = await prisma.user.findUniqueOrThrow({
-      where: { id: auth.id },
-      select: {
-        id: true, email: true, name: true, role: true, jobTitle: true,
-        avatarColor: true, timezone: true, weeklyHours: true, lastLoginAt: true,
-      },
+    const user = await firstOrThrow(
+      db('User')
+        .select('id', 'email', 'name', 'role', 'jobTitle', 'avatarColor', 'timezone', 'weeklyHours', 'lastLoginAt')
+        .where({ id: auth.id })
+        .first(),
+      'User',
+    );
+    res.json({
+      user: { ...user, weeklyHours: toDecimalString(user.weeklyHours) },
+      capabilities: capabilitiesFor(auth),
     });
-    res.json({ user, capabilities: capabilitiesFor(auth) });
   }),
 );
 
@@ -128,19 +132,21 @@ authRouter.post(
     const body = parseBody(registerBody, req.body);
     const email = body.email.toLowerCase();
 
-    const existing = await prisma.user.findUnique({ where: { email }, select: { id: true } });
+    const existing = await db('User').select('id').where({ email }).first();
     if (existing) throw conflict('A user with that email already exists');
 
-    const user = await prisma.user.create({
-      data: {
-        email,
-        name: body.name,
-        role: body.role,
-        passwordHash: await hashPassword(body.password),
-        avatarColor: pickAvatarColor(body.name),
-      },
-      select: { id: true, email: true, name: true, role: true, avatarColor: true },
+    const created = await insertReturning(db, 'User', {
+      id: newId(),
+      email,
+      name: body.name,
+      role: body.role,
+      passwordHash: await hashPassword(body.password),
+      avatarColor: pickAvatarColor(body.name),
     });
+    const user = {
+      id: created.id, email: created.email, name: created.name,
+      role: created.role, avatarColor: created.avatarColor,
+    };
 
     await recordAudit({
       actorId: actor.id,
@@ -163,11 +169,11 @@ authRouter.get(
     requireUser(req);
     // Any signed-in user may see the internal directory — it is how a PM picks
     // an assignee. Nothing sensitive is exposed here.
-    const users = await prisma.user.findMany({
-      where: { isActive: true },
-      orderBy: { name: 'asc' },
-      select: { id: true, name: true, email: true, role: true, jobTitle: true, avatarColor: true },
-    });
+    const users = await db('User')
+      .select('id', 'name', 'email', 'role', 'jobTitle', 'avatarColor')
+      // MySQL stores this as TINYINT(1); `true` would not match.
+      .where({ isActive: fromBool(true) })
+      .orderBy('name', 'asc');
     res.json({ users });
   }),
 );

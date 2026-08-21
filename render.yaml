@@ -1,9 +1,8 @@
 # One-command deployment of the three services this product needs.
 # Deploy with: render blueprint launch  (or connect the repo in the dashboard)
-databases:
-  - name: deliveryos-db
-    databaseName: deliveryos
-    plan: basic-256mb
+# Render does not offer managed MySQL. Point DB_* at your MySQL provider
+# (PlanetScale, Aiven, RDS, or your existing host) and set DB_SSL=true —
+# every managed MySQL requires TLS.
 
 services:
   - type: web
@@ -16,8 +15,18 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: DATABASE_URL
-        fromDatabase: { name: deliveryos-db, property: connectionString }
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: '3306'
+      - key: DB_NAME
+        value: deliveryos
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_SSL
+        value: 'true'
       - key: JWT_SECRET
         generateValue: true
       - key: WEB_ORIGIN

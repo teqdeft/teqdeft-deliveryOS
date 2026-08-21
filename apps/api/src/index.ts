@@ -1,6 +1,6 @@
 import { createApp } from './app.js';
 import { env, aiAvailable } from './env.js';
-import { prisma } from './db.js';
+import { closeDb, pingDb } from './db/index.js';
 import { logger } from './lib/logger.js';
 
 const app = createApp();
@@ -18,7 +18,7 @@ const server = app.listen(env.PORT, () => {
 async function shutdown(signal: string) {
   logger.info({ signal }, 'Shutting down');
   server.close(async () => {
-    await prisma.$disconnect();
+    await closeDb();
     process.exit(0);
   });
   // Do not let a hung connection hold the process open forever.

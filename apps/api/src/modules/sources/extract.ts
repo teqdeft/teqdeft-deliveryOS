@@ -1,4 +1,4 @@
-import type { SourceKind } from '@prisma/client';
+import type { SourceKind } from '@deliveryos/shared';
 
 export interface ExtractedFragment {
   ordinal: number;

@@ -3,7 +3,7 @@
 #
 #   ./setup.sh
 #
-# Starts PostgreSQL in Docker, installs dependencies, creates the schema,
+# Starts MySQL in Docker, installs dependencies, runs the migrations,
 # loads demo data, and tells you what to do next. Safe to run more than once.
 set -euo pipefail
 
@@ -24,8 +24,13 @@ ok "Node.js $(node -v)"
 # Having the docker CLI is not the same as having a running daemon. Docker
 # Desktop installed but not started is the most common case of all, and it
 # fails with an obscure socket error unless we check for it here.
-have_postgres() {
-  command -v pg_isready >/dev/null && pg_isready -h localhost -p 5432 >/dev/null 2>&1
+have_mysql() {
+  # mysqladmin when it is installed; otherwise just check the port is open, so
+  # this works against a MySQL the user runs however they like.
+  if command -v mysqladmin >/dev/null; then
+    mysqladmin ping -h 127.0.0.1 -P 3306 >/dev/null 2>&1 && return 0
+  fi
+  (exec 3<>/dev/tcp/127.0.0.1/3306) >/dev/null 2>&1
 }
 
 USE_DOCKER=0
@@ -33,38 +38,38 @@ if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
   if docker info >/dev/null 2>&1; then
     USE_DOCKER=1
     ok "Docker is running"
-  elif have_postgres; then
-    warn "Docker is installed but not running — using the PostgreSQL already on localhost:5432"
+  elif have_mysql; then
+    warn "Docker is installed but not running — using the MySQL already on localhost:3306"
   else
     die "Docker is installed but not running. Start Docker Desktop and run this again.
-     (Or, if you already have PostgreSQL, start it on localhost:5432 and re-run.)"
+     (Or, if you already have MySQL 8, start it on localhost:3306 and re-run.)"
   fi
-elif have_postgres; then
-  ok "Using the PostgreSQL already running on localhost:5432"
+elif have_mysql; then
+  ok "Using the MySQL already running on localhost:3306"
 else
   die "No database available.
      Install Docker Desktop from https://docker.com/products/docker-desktop and start it,
-     then run this again. Or start your own PostgreSQL on localhost:5432."
+     then run this again. Or start your own MySQL 8 on localhost:3306."
 fi
 
 bold $'\nStarting the database'
 if [ "$USE_DOCKER" = "1" ]; then
   docker compose up -d --wait db >/dev/null 2>&1 || docker compose up -d db >/dev/null
   # --wait is not on every Compose version, so poll the healthcheck ourselves.
-  for _ in $(seq 1 40); do
-    if docker compose exec -T db pg_isready -U postgres -d deliveryos >/dev/null 2>&1; then break; fi
-    sleep 1
+  # MySQL's first boot initialises the data directory and takes appreciably
+  # longer than a warm start, hence the generous ceiling.
+  printf '  waiting for MySQL'
+  for _ in $(seq 1 90); do
+    if docker compose exec -T db mysqladmin ping -h 127.0.0.1 -uroot -proot >/dev/null 2>&1; then break; fi
+    printf '.'; sleep 1
   done
-  docker compose exec -T db pg_isready -U postgres -d deliveryos >/dev/null 2>&1 \
-    || die "PostgreSQL did not become ready. Check: docker compose logs db"
-  ok "PostgreSQL ready on localhost:5432"
+  printf '\n'
+  docker compose exec -T db mysqladmin ping -h 127.0.0.1 -uroot -proot >/dev/null 2>&1 \
+    || die "MySQL did not become ready. Check: docker compose logs db"
+  ok "MySQL ready on localhost:3306"
 else
-  have_postgres || die "PostgreSQL stopped responding on localhost:5432."
-  # Using an existing server, so the database itself may not exist yet.
-  if command -v createdb >/dev/null; then
-    createdb -h localhost -U postgres deliveryos 2>/dev/null && ok "Created the deliveryos database" || true
-  fi
-  ok "PostgreSQL ready on localhost:5432"
+  have_mysql || die "MySQL stopped responding on localhost:3306."
+  ok "MySQL ready on localhost:3306"
 fi
 
 bold $'\nCreating your local settings file'
@@ -88,8 +93,7 @@ ok "Dependencies installed"
 
 bold $'\nSetting up the database'
 npm run build -w @deliveryos/shared >/dev/null
-npm run db:generate -w @deliveryos/api >/dev/null 2>&1
-npm run db:deploy -w @deliveryos/api >/dev/null
+npm run db:migrate -w @deliveryos/api >/dev/null
 ok "Schema created"
 npm run db:seed -w @deliveryos/api >/dev/null
 ok "Demo project loaded"

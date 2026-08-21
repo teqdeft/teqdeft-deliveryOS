@@ -85,6 +85,26 @@ check("the source was fragmented for citation", True,
 check("a source with no content is rejected", 400, call("POST", f"/projects/{pid}/sources", pm,
       {"title": "Empty", "kind": "NOTE", "authority": "INTERNAL_NOTE", "statedAt": "2026-01-20"})[0])
 
+section("search filter under hostile input")
+# The LIKE escaping is hand-rolled, so it gets probed rather than trusted.
+# A wildcard must match literally, and no input may reach SQL unbound.
+def search_total(term):
+    from urllib.parse import quote
+    return call("GET", f"/projects?search={quote(term, safe='')}", pm)[1].get("total")
+
+check("a real term still matches", 1, search_total("Northwind"))
+for label, term in [
+    ("a bare % does not match everything", "%"),
+    ("a bare _ does not match everything", "_"),
+    ("a SQL comment is treated as text", "' OR 1=1 --"),
+    ("a UNION attempt is treated as text", "x' UNION SELECT 1,2,3--"),
+    ("a DROP attempt is treated as text", "'; DROP TABLE Project; --"),
+    ("a backslash is treated as text", "back\\slash"),
+]:
+    check(label, 0, search_total(term))
+# If any of the above had executed, this would not still be 2.
+check("the schema survived those probes", True, call("GET", "/projects", pm)[1]["total"] >= 2)
+
 section("AI gating (§16 graceful degradation)")
 _, policy = call("GET", f"/projects/{pid}/ai/policy", pm)
 st, bd = call("POST", f"/projects/{pid}/ai/analyse", pm, {})

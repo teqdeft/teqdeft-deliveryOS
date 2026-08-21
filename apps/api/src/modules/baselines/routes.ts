@@ -1,7 +1,8 @@
 import { Router } from 'express';
-import type { Prisma } from '@prisma/client';
 import { approveBaselineBody, proposeBaselineBody, type BaselineDiff, type BaselineDiffEntry } from '@deliveryos/shared';
-import { prisma } from '../../db.js';
+import {
+  db, transaction, countRows, fromBool, fromJson, indexBy, insertReturning, newId, toBool, toJson,
+} from '../../db/index.js';
 import { requireUser } from '../../lib/auth.js';
 import { parseBody, route } from '../../lib/http.js';
 import { requireCapability, requireProjectAccess } from '../../lib/rbac.js';
@@ -17,19 +18,11 @@ baselinesRouter.get(
     const user = requireUser(req);
     const project = await requireProjectAccess(user, req.params.projectId);
 
-    const baselines = await prisma.scopeBaseline.findMany({
-      where: { projectId: project.id },
-      orderBy: { version: 'desc' },
-      include: {
-        _count: { select: { requirements: true } },
-        approvals: {
-          include: { approver: { select: { id: true, name: true, avatarColor: true } } },
-          orderBy: { createdAt: 'asc' },
-        },
-      },
-    });
+    const rows = await db('ScopeBaseline')
+      .where({ projectId: project.id })
+      .orderBy('version', 'desc');
 
-    res.json({ baselines });
+    res.json({ baselines: await attachBaselineRelations(rows) });
   }),
 );
 
@@ -39,21 +32,45 @@ baselinesRouter.get(
     const user = requireUser(req);
     const project = await requireProjectAccess(user, req.params.projectId);
 
-    const baseline = await prisma.scopeBaseline.findFirst({
-      where: { id: req.params.baselineId, projectId: project.id },
-      include: {
-        requirements: { orderBy: { requirement: { reference: 'asc' } }, include: { requirement: { select: { reference: true } } } },
-        approvals: { include: { approver: { select: { id: true, name: true, avatarColor: true } } } },
-      },
-    });
-    if (!baseline) throw notFound('Baseline');
+    const row = await db('ScopeBaseline')
+      .where({ id: req.params.baselineId, projectId: project.id })
+      .first();
+    if (!row) throw notFound('Baseline');
 
-    const previous = await prisma.scopeBaseline.findFirst({
-      where: { projectId: project.id, version: baseline.version - 1 },
-      include: { requirements: true },
-    });
+    const [withRelations] = await attachBaselineRelations([row]);
 
-    res.json({ baseline, diff: buildDiff(previous?.requirements ?? null, baseline.requirements, previous?.version ?? null, baseline.version) });
+    // Snapshot rows carry the frozen text, so ordering joins Requirement only
+    // for its human-facing reference.
+    const entries = await db('BaselineRequirement as br')
+      .select('br.*', 'r.reference as requirement_reference')
+      .join('Requirement as r', 'r.id', 'br.requirementId')
+      .where('br.baselineId', row.id)
+      .orderBy('r.reference', 'asc');
+
+    const requirements = entries.map((e: Record<string, unknown>) => ({
+      ...e,
+      isExclusion: toBool(e.isExclusion),
+      acceptanceCriteria: toJson(e.acceptanceCriteria, [] as string[]),
+      citationSnapshot: toJson(e.citationSnapshot, [] as unknown[]),
+      requirement: { reference: e.requirement_reference },
+    }));
+
+    const previous = await db('ScopeBaseline')
+      .where({ projectId: project.id, version: row.version - 1 })
+      .first();
+    const previousRequirements = previous
+      ? await db('BaselineRequirement').where({ baselineId: previous.id })
+      : null;
+
+    res.json({
+      baseline: { ...withRelations, requirements },
+      diff: buildDiff(
+        previousRequirements as never,
+        requirements as never,
+        previous?.version ?? null,
+        row.version,
+      ),
+    });
   }),
 );
 
@@ -72,27 +89,26 @@ baselinesRouter.post(
     const project = await requireProjectAccess(user, req.params.projectId);
     const body = parseBody(proposeBaselineBody, req.body);
 
-    const pending = await prisma.scopeBaseline.findFirst({
-      where: { projectId: project.id, state: { in: ['DRAFT', 'PENDING_APPROVAL'] } },
-      select: { id: true, version: true },
-    });
+    const pending = await db('ScopeBaseline')
+      .select('id', 'version')
+      .where({ projectId: project.id })
+      .whereIn('state', ['DRAFT', 'PENDING_APPROVAL'])
+      .first();
     if (pending) {
       throw gateFailed(`Version ${pending.version} is already awaiting approval. Approve or withdraw it first.`, {
         baselineId: pending.id,
       });
     }
 
-    const approved = await prisma.requirement.findMany({
-      where: { projectId: project.id, reviewState: 'APPROVED' },
-      include: { citations: { include: { fragment: { select: { locator: true, source: { select: { title: true, authority: true } } } } } } },
-      orderBy: { reference: 'asc' },
-    });
+    const approved = await db('Requirement')
+      .where({ projectId: project.id, reviewState: 'APPROVED' })
+      .orderBy('reference', 'asc');
 
     if (approved.length === 0) {
       throw gateFailed('No requirements are approved yet. Review them in the Requirements Studio first.');
     }
 
-    const openConflicts = await prisma.conflict.count({ where: { projectId: project.id, state: 'OPEN' } });
+    const openConflicts = await countRows(db('Conflict').where({ projectId: project.id, state: 'OPEN' }));
     if (openConflicts > 0) {
       // §5 stage 3: critical questions must be answered before the scope gate.
       throw gateFailed(
@@ -100,45 +116,65 @@ baselinesRouter.post(
       );
     }
 
-    const baseline = await prisma.$transaction(async (tx) => {
-      const last = await tx.scopeBaseline.findFirst({
-        where: { projectId: project.id },
-        orderBy: { version: 'desc' },
-        select: { version: true },
-      });
+    const baseline = await transaction(async (tx) => {
+      const last = await tx('ScopeBaseline')
+        .select('version')
+        .where({ projectId: project.id })
+        .orderBy('version', 'desc')
+        .first();
       const version = (last?.version ?? 0) + 1;
 
-      const created = await tx.scopeBaseline.create({
-        data: {
-          projectId: project.id,
-          version,
-          title: body.title,
-          state: 'PENDING_APPROVAL',
-          changeReason: body.changeReason ?? null,
-          effectiveDate: body.effectiveDate ?? null,
-          proposedById: user.id,
-          proposedAt: new Date(),
-          requirements: {
-            create: approved.map((r) => ({
-              requirementId: r.id,
-              title: r.title,
-              statement: r.statement,
-              requirementClass: r.requirementClass,
-              priority: r.priority,
-              acceptanceCriteria: r.acceptanceCriteria as Prisma.InputJsonValue,
-              isExclusion: r.isExclusion,
-              citationSnapshot: r.citations.map((c) => ({
-                fragmentId: c.sourceFragmentId,
-                locator: c.fragment.locator,
-                sourceTitle: c.fragment.source.title,
-                authority: c.fragment.source.authority,
-                quote: c.quote,
-              })) as Prisma.InputJsonValue,
-            })),
-          },
-        },
-        include: { _count: { select: { requirements: true } } },
+      const created = await insertReturning(tx, 'ScopeBaseline', {
+        id: newId(),
+        projectId: project.id,
+        version,
+        title: body.title,
+        state: 'PENDING_APPROVAL',
+        changeReason: body.changeReason ?? null,
+        effectiveDate: body.effectiveDate ?? null,
+        proposedById: user.id,
+        proposedAt: new Date(),
       });
+
+      // Snapshot the citations alongside the text: the baseline must still
+      // show what evidence supported each requirement even if the source is
+      // later reprocessed.
+      const citations = await tx('RequirementCitation as c')
+        .select('c.requirementId', 'c.sourceFragmentId', 'c.quote', 'f.locator', 's.title as sourceTitle', 's.authority')
+        .join('SourceFragment as f', 'f.id', 'c.sourceFragmentId')
+        .join('Source as s', 's.id', 'f.sourceId')
+        .whereIn('c.requirementId', approved.map((r) => r.id));
+
+      const citationsByRequirement = new Map<string, unknown[]>();
+      for (const c of citations as Record<string, unknown>[]) {
+        const key = c.requirementId as string;
+        const list = citationsByRequirement.get(key) ?? [];
+        list.push({
+          fragmentId: c.sourceFragmentId,
+          locator: c.locator,
+          sourceTitle: c.sourceTitle,
+          authority: c.authority,
+          quote: c.quote,
+        });
+        citationsByRequirement.set(key, list);
+      }
+
+      await tx.batchInsert(
+        'BaselineRequirement',
+        approved.map((r) => ({
+          id: newId(),
+          baselineId: created.id,
+          requirementId: r.id,
+          title: r.title,
+          statement: r.statement,
+          requirementClass: r.requirementClass,
+          priority: r.priority,
+          acceptanceCriteria: fromJson(toJson(r.acceptanceCriteria, [] as string[])),
+          isExclusion: r.isExclusion,
+          citationSnapshot: fromJson(citationsByRequirement.get(r.id) ?? []),
+        })),
+        200,
+      );
 
       await recordAudit(
         {
@@ -154,7 +190,7 @@ baselinesRouter.post(
         tx,
       );
 
-      return created;
+      return { ...created, _count: { requirements: approved.length } };
     });
 
     res.status(201).json({ baseline });
@@ -174,11 +210,16 @@ baselinesRouter.post(
     const project = await requireProjectAccess(user, req.params.projectId);
     const body = parseBody(approveBaselineBody, req.body);
 
-    const baseline = await prisma.scopeBaseline.findFirst({
-      where: { id: req.params.baselineId, projectId: project.id },
-      include: { _count: { select: { requirements: true } } },
-    });
-    if (!baseline) throw notFound('Baseline');
+    const baselineRow = await db('ScopeBaseline')
+      .where({ id: req.params.baselineId, projectId: project.id })
+      .first();
+    if (!baselineRow) throw notFound('Baseline');
+    const baseline = {
+      ...baselineRow,
+      _count: {
+        requirements: await countRows(db('BaselineRequirement').where({ baselineId: baselineRow.id })),
+      },
+    };
     if (baseline.state === 'APPROVED') throw gateFailed('This baseline is already approved. Propose a new version instead.');
     if (baseline.state === 'SUPERSEDED') throw gateFailed('This baseline has been superseded.');
 
@@ -195,46 +236,37 @@ baselinesRouter.post(
       );
     }
 
-    const approved = await prisma.$transaction(async (tx) => {
-      const previous = await tx.scopeBaseline.findFirst({
-        where: { projectId: project.id, state: 'APPROVED' },
-        select: { id: true, version: true },
-      });
+    const approvedBaseline = await transaction(async (tx) => {
+      const previous = await tx('ScopeBaseline')
+        .select('id', 'version')
+        .where({ projectId: project.id, state: 'APPROVED' })
+        .first();
 
       if (previous) {
-        await tx.scopeBaseline.update({
-          where: { id: previous.id },
-          data: { state: 'SUPERSEDED', supersededAt: new Date() },
-        });
+        await tx('ScopeBaseline')
+          .where({ id: previous.id })
+          .update({ state: 'SUPERSEDED', supersededAt: new Date() });
       }
 
-      const next = await tx.scopeBaseline.update({
-        where: { id: baseline.id },
-        data: {
-          state: 'APPROVED',
-          approvedById: user.id,
-          approvedAt: new Date(),
-          effectiveDate: baseline.effectiveDate ?? new Date(),
-        },
-        include: { _count: { select: { requirements: true } } },
+      await tx('ScopeBaseline').where({ id: baseline.id }).update({
+        state: 'APPROVED',
+        approvedById: user.id,
+        approvedAt: new Date(),
+        effectiveDate: baseline.effectiveDate ?? new Date(),
       });
 
-      await tx.approval.create({
-        data: {
-          projectId: project.id,
-          subject: 'SCOPE_BASELINE',
-          decision: 'APPROVED',
-          comment: body.comment ?? null,
-          approverId: user.id,
-          baselineId: baseline.id,
-          baselineVersion: baseline.version,
-        },
+      await tx('Approval').insert({
+        id: newId(),
+        projectId: project.id,
+        subject: 'SCOPE_BASELINE',
+        decision: 'APPROVED',
+        comment: body.comment ?? null,
+        approverId: user.id,
+        baselineId: baseline.id,
+        baselineVersion: baseline.version,
       });
 
-      await tx.project.update({
-        where: { id: project.id },
-        data: { stage: 'DELIVERY_PLANNING' },
-      });
+      await tx('Project').where({ id: project.id }).update({ stage: 'DELIVERY_PLANNING' });
 
       await recordAudit(
         {
@@ -255,13 +287,55 @@ baselinesRouter.post(
         tx,
       );
 
-      return next;
+      const next = await tx('ScopeBaseline').where({ id: baseline.id }).first();
+      return { ...next!, _count: { requirements: baseline._count.requirements } };
     });
 
     await refreshProjectHealth(project.id);
-    res.json({ baseline: approved });
+    res.json({ baseline: approvedBaseline });
   }),
 );
+
+/**
+ * Attaches the requirement count and the approval trail to a set of baselines,
+ * in a fixed number of queries regardless of how many versions exist.
+ */
+async function attachBaselineRelations(rows: { id: string }[]) {
+  if (rows.length === 0) return [];
+  const ids = rows.map((r) => r.id);
+
+  const [counts, approvals] = await Promise.all([
+    db('BaselineRequirement').select('baselineId').count({ n: '*' }).whereIn('baselineId', ids).groupBy('baselineId'),
+    db('Approval as a')
+      .select('a.*', 'User.id as approver_id', 'User.name as approver_name', 'User.avatarColor as approver_avatarColor')
+      .join('User', 'User.id', 'a.approverId')
+      .whereIn('a.baselineId', ids)
+      .orderBy('a.createdAt', 'asc'),
+  ]);
+
+  const countByBaseline = new Map(
+    (counts as unknown as { baselineId: string; n: number | string }[]).map((c) => [c.baselineId, Number(c.n)]),
+  );
+  const approvalsByBaseline = new Map<string, unknown[]>();
+  for (const a of approvals as Record<string, unknown>[]) {
+    const key = a.baselineId as string;
+    const list = approvalsByBaseline.get(key) ?? [];
+    list.push({
+      id: a.id,
+      decision: a.decision,
+      comment: a.comment,
+      createdAt: a.createdAt,
+      approver: { id: a.approver_id, name: a.approver_name, avatarColor: a.approver_avatarColor },
+    });
+    approvalsByBaseline.set(key, list);
+  }
+
+  return rows.map((row) => ({
+    ...row,
+    _count: { requirements: countByBaseline.get(row.id) ?? 0 },
+    approvals: approvalsByBaseline.get(row.id) ?? [],
+  }));
+}
 
 /** Diff between two versions — the "scope comparison" §7.3 asks for. */
 function buildDiff(

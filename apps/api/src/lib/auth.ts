@@ -1,9 +1,9 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import type { NextFunction, Request, Response } from 'express';
-import type { Role } from '@prisma/client';
+import type { Role } from '@deliveryos/shared';
 import { env } from '../env.js';
-import { prisma } from '../db.js';
+import { db, toBool } from '../db/index.js';
 import { unauthorized } from './errors.js';
 
 export interface AuthUser {
@@ -74,12 +74,14 @@ export async function authenticate(req: Request, _res: Response, next: NextFunct
       throw unauthorized('Your session has expired. Sign in again.');
     }
 
-    const user = await prisma.user.findUnique({
-      where: { id: String(payload.sub) },
-      select: { id: true, email: true, name: true, role: true, isActive: true },
-    });
+    const user = await db('User')
+      .select('id', 'email', 'name', 'role', 'isActive')
+      .where({ id: String(payload.sub) })
+      .first();
 
-    if (!user || !user.isActive) throw unauthorized('This account is no longer active');
+    // MySQL returns TINYINT(1) as 0/1, and `!user.isActive` is false for both
+    // — a deactivated account would keep working without this conversion.
+    if (!user || !toBool(user.isActive)) throw unauthorized('This account is no longer active');
 
     req.user = { id: user.id, email: user.email, name: user.name, role: user.role };
     next();

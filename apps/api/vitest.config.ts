@@ -10,9 +10,13 @@ export default defineConfig({
       AI_DEFAULT_PROVIDER: 'ANTHROPIC',
       ANTHROPIC_API_KEY: 'test-key',
       OPENAI_API_KEY: '',
-      DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/deliveryos_test',
+      DB_HOST: '127.0.0.1',
+      DB_PORT: '3306',
+      DB_NAME: 'deliveryos_test',
+      DB_USER: 'deliveryos',
+      DB_PASSWORD: 'deliveryos',
       JWT_SECRET: 'test-secret-that-is-long-enough-for-validation',
-      TEST_DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/deliveryos_test?schema=public',
+
     },
   },
 });

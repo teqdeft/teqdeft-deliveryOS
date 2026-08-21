@@ -1,5 +1,4 @@
-import type { Prisma } from '@prisma/client';
-import type { Tx } from '../../db.js';
+import { fromJson, newId, type Db } from '../../db/index.js';
 
 /**
  * §7.2: "Reviewers can edit wording, split, merge, reject or convert items
@@ -10,7 +9,7 @@ import type { Tx } from '../../db.js';
  * remains recoverable months later.
  */
 export async function appendRevision(
-  tx: Tx,
+  tx: Db,
   params: {
     requirementId: string;
     action: string;
@@ -20,22 +19,21 @@ export async function appendRevision(
     reason?: string | null;
   },
 ): Promise<void> {
-  const last = await tx.requirementRevision.findFirst({
-    where: { requirementId: params.requirementId },
-    orderBy: { revision: 'desc' },
-    select: { revision: true },
-  });
+  const last = await tx('RequirementRevision')
+    .select('revision')
+    .where({ requirementId: params.requirementId })
+    .orderBy('revision', 'desc')
+    .first();
 
-  await tx.requirementRevision.create({
-    data: {
-      requirementId: params.requirementId,
-      revision: (last?.revision ?? 0) + 1,
-      action: params.action,
-      actorId: params.actorId,
-      snapshot: params.snapshot as Prisma.InputJsonValue,
-      changes: (params.changes ?? {}) as Prisma.InputJsonValue,
-      reason: params.reason ?? null,
-    },
+  await tx('RequirementRevision').insert({
+    id: newId(),
+    requirementId: params.requirementId,
+    revision: (last?.revision ?? 0) + 1,
+    action: params.action,
+    actorId: params.actorId,
+    snapshot: fromJson(params.snapshot),
+    changes: fromJson(params.changes ?? {}),
+    reason: params.reason ?? null,
   });
 }
 

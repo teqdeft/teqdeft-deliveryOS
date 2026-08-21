@@ -1,4 +1,4 @@
-import type { AiJobType, AiProvider } from '@prisma/client';
+import type { AiJobType, AiProvider } from '@deliveryos/shared';
 import { env } from '../env.js';
 
 export interface ModelPolicy {

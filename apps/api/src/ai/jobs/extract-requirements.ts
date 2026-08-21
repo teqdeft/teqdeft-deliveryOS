@@ -1,6 +1,7 @@
-import type { Prisma } from '@prisma/client';
 import { extractionResult, type ExtractedRequirement, type Citation } from '@deliveryos/shared';
-import { prisma } from '../../db.js';
+import {
+  db, transaction, firstOrThrow, fromBool, fromJson, indexBy, insertReturning, newId, toBool,
+} from '../../db/index.js';
 import { recordAudit } from '../../lib/audit.js';
 import { nextReferenceBlock } from '../../lib/reference.js';
 import { logger } from '../../lib/logger.js';
@@ -40,29 +41,39 @@ export async function extractRequirements(params: {
 }): Promise<ExtractionOutcome> {
   const { projectId, userId } = params;
 
-  const project = await prisma.project.findUniqueOrThrow({
-    where: { id: projectId },
-    select: { id: true, name: true, code: true, engagementType: true, externalAiEnabled: true },
-  });
+  const project = await firstOrThrow(
+    db('Project')
+      .select('id', 'name', 'code', 'engagementType', 'externalAiEnabled')
+      .where({ id: projectId })
+      .first(),
+    'Project',
+  );
 
   // §16.1 — a project can be barred from external AI processing entirely, and
   // that switch has to be checked at the last moment before data leaves.
-  if (!project.externalAiEnabled) {
+  if (!toBool(project.externalAiEnabled)) {
     throw new Error('External AI processing is disabled for this project. Enable it in project settings first.');
   }
 
-  const sources = await prisma.source.findMany({
-    where: {
-      projectId,
-      processingState: 'READY',
-      ...(params.sourceIds.length > 0 ? { id: { in: params.sourceIds } } : {}),
-      // §16.1 — restricted material never leaves the building, whatever the
-      // caller selected in the UI.
-      confidentiality: { not: 'RESTRICTED' },
-    },
-    include: { fragments: { orderBy: { ordinal: 'asc' } } },
-    orderBy: [{ authority: 'asc' }, { statedAt: 'desc' }],
-  });
+  const sourceQuery = db('Source')
+    .where({ projectId, processingState: 'READY' })
+    // §16.1 — restricted material never leaves the building, whatever the
+    // caller selected in the UI.
+    .whereNot('confidentiality', 'RESTRICTED')
+    .orderBy([{ column: 'authority', order: 'asc' }, { column: 'statedAt', order: 'desc' }]);
+  if (params.sourceIds.length > 0) sourceQuery.whereIn('id', params.sourceIds);
+
+  const sourceRows = await sourceQuery;
+  const allFragments = await db('SourceFragment')
+    .whereIn('sourceId', sourceRows.map((s) => s.id))
+    .orderBy([{ column: 'sourceId', order: 'asc' }, { column: 'ordinal', order: 'asc' }]);
+  const fragmentsBySource = new Map<string, typeof allFragments>();
+  for (const fragment of allFragments) {
+    const list = fragmentsBySource.get(fragment.sourceId) ?? [];
+    list.push(fragment);
+    fragmentsBySource.set(fragment.sourceId, list);
+  }
+  const sources = sourceRows.map((s) => ({ ...s, fragments: fragmentsBySource.get(s.id) ?? [] }));
 
   if (sources.length === 0) {
     throw new Error('No analysable sources. Upload a proposal, transcript or email, and check none are marked Restricted.');
@@ -90,21 +101,21 @@ export async function extractRequirements(params: {
 
   const policy = resolvePolicy('REQUIREMENT_EXTRACTION', params.provider);
 
-  const run = await prisma.aiRun.create({
-    data: {
-      projectId,
-      jobType: 'REQUIREMENT_EXTRACTION',
-      state: 'RUNNING',
-      provider: policy.provider,
-      model: policy.model,
-      promptVersion: EXTRACTION_PROMPT_VERSION,
-      schemaVersion: SCHEMA_VERSION,
-      inputSourceIds: sources.map((s) => s.id) as Prisma.InputJsonValue,
-      inputChars: corpus.join('\n').length,
-      instructions: params.instructions ?? null,
-      triggeredById: userId,
-      startedAt: new Date(),
-    },
+  const run = await insertReturning(db, 'AiRun', {
+    id: newId(),
+    projectId,
+    jobType: 'REQUIREMENT_EXTRACTION',
+    state: 'RUNNING',
+    provider: policy.provider,
+    model: policy.model,
+    promptVersion: EXTRACTION_PROMPT_VERSION,
+    schemaVersion: SCHEMA_VERSION,
+    inputSourceIds: fromJson(sources.map((s) => s.id)),
+    inputChars: corpus.join('\n').length,
+    instructions: params.instructions ?? null,
+    warnings: fromJson([]),
+    triggeredById: userId,
+    startedAt: new Date(),
   });
 
   const warnings: string[] = [];
@@ -150,122 +161,119 @@ export async function extractRequirements(params: {
       .map((r) => verifyRequirement(r, fragmentIndex, warnings))
       .filter((r): r is ExtractedRequirement => r !== null);
 
-    const outcome = await prisma.$transaction(
-      async (tx) => {
-        const references = await nextReferenceBlock(tx, projectId, 'requirement', verifiedRequirements.length);
+    const outcome = await transaction(async (tx) => {
+      const references = await nextReferenceBlock(tx, projectId, 'requirement', verifiedRequirements.length);
 
-        let created = 0;
-        for (const [index, requirement] of verifiedRequirements.entries()) {
-          await tx.requirement.create({
-            data: {
-              projectId,
-              reference: references[index]!,
-              title: requirement.title,
-              statement: requirement.statement,
-              requirementClass: requirement.requirementClass,
-              priority: requirement.priority,
-              // Never APPROVED. §8.3: AI drafts, humans decide.
-              reviewState: 'DRAFT',
-              origin: 'AI_EXTRACTION',
-              confidence: requirement.confidence,
-              acceptanceCriteria: requirement.acceptanceCriteria as Prisma.InputJsonValue,
-              isExclusion: requirement.isExclusion,
-              isAssumption: requirement.isAssumption,
-              openQuestion: requirement.openQuestion,
-              aiRunId: run.id,
-              citations: {
-                create: dedupeCitations(requirement.citations).map((c) => ({
-                  sourceFragmentId: c.sourceFragmentId,
-                  quote: c.quote.slice(0, 2000),
-                })),
-              },
-            },
-          });
-          created += 1;
+      let created = 0;
+      for (const [index, requirement] of verifiedRequirements.entries()) {
+        const row = await insertReturning(tx, 'Requirement', {
+          id: newId(),
+          projectId,
+          reference: references[index]!,
+          title: requirement.title,
+          statement: requirement.statement,
+          requirementClass: requirement.requirementClass,
+          priority: requirement.priority,
+          // Never APPROVED. §8.3: AI drafts, humans decide.
+          reviewState: 'DRAFT',
+          origin: 'AI_EXTRACTION',
+          confidence: requirement.confidence.toString(),
+          acceptanceCriteria: fromJson(requirement.acceptanceCriteria),
+          isExclusion: fromBool(requirement.isExclusion),
+          isAssumption: fromBool(requirement.isAssumption),
+          openQuestion: requirement.openQuestion,
+          aiRunId: run.id,
+        });
+
+        await tx('RequirementCitation').insert(
+          dedupeCitations(requirement.citations).map((c) => ({
+            id: newId(),
+            requirementId: row.id,
+            sourceFragmentId: c.sourceFragmentId,
+            quote: c.quote.slice(0, 2000),
+          })),
+        );
+        created += 1;
+      }
+
+      let conflictsCreated = 0;
+      for (const conflict of conflicts) {
+        const sideA = conflict.citationsA.filter((c) => fragmentIndex.has(c.sourceFragmentId));
+        const sideB = conflict.citationsB.filter((c) => fragmentIndex.has(c.sourceFragmentId));
+        // A conflict whose evidence we cannot resolve is not reviewable —
+        // it would ask a human to arbitrate between two unverifiable claims.
+        if (sideA.length === 0 || sideB.length === 0) {
+          warnings.push(`Dropped a conflict ("${conflict.summary.slice(0, 60)}…") — its citations could not be verified.`);
+          continue;
         }
 
-        let conflictsCreated = 0;
-        for (const conflict of conflicts) {
-          const sideA = conflict.citationsA.filter((c) => fragmentIndex.has(c.sourceFragmentId));
-          const sideB = conflict.citationsB.filter((c) => fragmentIndex.has(c.sourceFragmentId));
-          // A conflict whose evidence we cannot resolve is not reviewable —
-          // it would ask a human to arbitrate between two unverifiable claims.
-          if (sideA.length === 0 || sideB.length === 0) {
-            warnings.push(`Dropped a conflict ("${conflict.summary.slice(0, 60)}…") — its citations could not be verified.`);
-            continue;
-          }
+        const conflictRow = await insertReturning(tx, 'Conflict', {
+          id: newId(),
+          projectId,
+          summary: conflict.summary,
+          statementA: conflict.statementA,
+          statementB: conflict.statementB,
+          severity: conflict.severity,
+          suggestedResolution: conflict.suggestedResolution,
+          state: 'OPEN',
+          aiRunId: run.id,
+        });
 
-          await tx.conflict.create({
-            data: {
-              projectId,
-              summary: conflict.summary,
-              statementA: conflict.statementA,
-              statementB: conflict.statementB,
-              severity: conflict.severity,
-              suggestedResolution: conflict.suggestedResolution,
-              state: 'OPEN',
-              aiRunId: run.id,
-              citations: {
-                create: [
-                  ...sideA.map((c) => ({ sourceFragmentId: c.sourceFragmentId, side: 'A', quote: c.quote.slice(0, 2000) })),
-                  ...sideB.map((c) => ({ sourceFragmentId: c.sourceFragmentId, side: 'B', quote: c.quote.slice(0, 2000) })),
-                ],
-              },
-            },
-          });
-          conflictsCreated += 1;
-        }
+        await tx('ConflictCitation').insert([
+          ...sideA.map((c) => ({
+            id: newId(), conflictId: conflictRow.id, sourceFragmentId: c.sourceFragmentId,
+            side: 'A', quote: c.quote.slice(0, 2000),
+          })),
+          ...sideB.map((c) => ({
+            id: newId(), conflictId: conflictRow.id, sourceFragmentId: c.sourceFragmentId,
+            side: 'B', quote: c.quote.slice(0, 2000),
+          })),
+        ]);
+        conflictsCreated += 1;
+      }
 
-        await tx.aiRun.update({
-          where: { id: run.id },
-          data: {
-            state: 'AWAITING_REVIEW',
-            finishedAt: new Date(),
+      await tx('AiRun').where({ id: run.id }).update({
+        state: 'AWAITING_REVIEW',
+        finishedAt: new Date(),
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        costUsd: result.costUsd?.toString() ?? null,
+        latencyMs: result.latencyMs,
+        producedCount: created,
+        warnings: fromJson(warnings),
+        model: result.model,
+      });
+
+      await tx('Project')
+        .where({ id: projectId })
+        .update({ stage: conflictsCreated > 0 ? 'HUMAN_CLARIFICATION' : 'AI_ANALYSIS' });
+
+      await recordAudit(
+        {
+          projectId,
+          actorId: userId,
+          action: 'ai.extraction_completed',
+          entityType: 'AiRun',
+          entityId: run.id,
+          summary: `AI extraction drafted ${created} requirements and ${conflictsCreated} conflicts from ${sources.length} sources`,
+          detail: {
+            provider: result.provider,
+            model: result.model,
+            promptVersion: EXTRACTION_PROMPT_VERSION,
+            schemaVersion: SCHEMA_VERSION,
+            sourceIds: sources.map((s) => s.id),
             inputTokens: result.inputTokens,
             outputTokens: result.outputTokens,
             costUsd: result.costUsd,
-            latencyMs: result.latencyMs,
-            producedCount: created,
-            warnings: warnings as Prisma.InputJsonValue,
-            model: result.model,
+            attempts: result.attempts,
+            warnings,
           },
-        });
+        },
+        tx,
+      );
 
-        await tx.project.update({
-          where: { id: projectId },
-          data: { stage: conflictsCreated > 0 ? 'HUMAN_CLARIFICATION' : 'AI_ANALYSIS' },
-        });
-
-        await recordAudit(
-          {
-            projectId,
-            actorId: userId,
-            action: 'ai.extraction_completed',
-            entityType: 'AiRun',
-            entityId: run.id,
-            summary: `AI extraction drafted ${created} requirements and ${conflictsCreated} conflicts from ${sources.length} sources`,
-            detail: {
-              provider: result.provider,
-              model: result.model,
-              promptVersion: EXTRACTION_PROMPT_VERSION,
-              schemaVersion: SCHEMA_VERSION,
-              sourceIds: sources.map((s) => s.id),
-              inputTokens: result.inputTokens,
-              outputTokens: result.outputTokens,
-              costUsd: result.costUsd,
-              attempts: result.attempts,
-              warnings,
-            },
-          },
-          tx,
-        );
-
-        return { requirementsCreated: created, conflictsCreated };
-      },
-      // Extraction can produce hundreds of rows; the default 5s ceiling is not
-      // enough and a partial write would leave uncitable requirements behind.
-      { timeout: 120_000, maxWait: 10_000 },
-    );
+      return { requirementsCreated: created, conflictsCreated };
+    });
 
     await refreshProjectHealth(projectId);
 
@@ -280,9 +288,11 @@ export async function extractRequirements(params: {
     const message = err instanceof Error ? err.message : String(err);
     logger.error({ err, runId: run.id, projectId }, 'Requirement extraction failed');
 
-    await prisma.aiRun.update({
-      where: { id: run.id },
-      data: { state: 'FAILED', finishedAt: new Date(), error: message.slice(0, 2000), warnings: warnings as Prisma.InputJsonValue },
+    await db('AiRun').where({ id: run.id }).update({
+      state: 'FAILED',
+      finishedAt: new Date(),
+      error: message.slice(0, 2000),
+      warnings: fromJson(warnings),
     });
     await recordAudit({
       projectId,

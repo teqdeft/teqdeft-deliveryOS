@@ -1,6 +1,6 @@
 import type { Request } from 'express';
-import type { Tx } from '../db.js';
-import { prisma } from '../db.js';
+import { db as defaultDb, type Db } from '../db/index.js';
+import { fromJson, newId } from '../db/index.js';
 
 export interface AuditInput {
   projectId?: string | null;
@@ -37,20 +37,21 @@ function scrub(value: unknown, depth = 0): unknown {
  *
  * Pass `tx` whenever the audited change is itself in a transaction.
  */
-export async function recordAudit(input: AuditInput, tx: Tx = prisma): Promise<void> {
+export async function recordAudit(input: AuditInput, tx: Db = defaultDb): Promise<void> {
   const ua = input.request?.headers?.['user-agent'];
-  await tx.auditEvent.create({
-    data: {
-      projectId: input.projectId ?? null,
-      actorId: input.actorId ?? null,
-      action: input.action,
-      entityType: input.entityType,
-      entityId: input.entityId ?? null,
-      summary: input.summary.slice(0, 1000),
-      detail: (scrub(input.detail ?? {}) ?? {}) as object,
-      ipAddress: input.request?.ip ?? null,
-      userAgent: typeof ua === 'string' ? ua.slice(0, 400) : null,
-    },
+  await tx('AuditEvent').insert({
+    id: newId(),
+    projectId: input.projectId ?? null,
+    actorId: input.actorId ?? null,
+    action: input.action,
+    entityType: input.entityType,
+    entityId: input.entityId ?? null,
+    summary: input.summary.slice(0, 1000),
+    // MySQL's JSON column takes a string through the driver's placeholder
+    // escaping; a bare object is stringified as "[object Object]".
+    detail: fromJson(scrub(input.detail ?? {}) ?? {}),
+    ipAddress: input.request?.ip ?? null,
+    userAgent: typeof ua === 'string' ? ua.slice(0, 400) : null,
   });
 }
 

@@ -1,4 +1,4 @@
-import type { Tx } from '../db.js';
+import type { Db } from '../db/index.js';
 
 /**
  * Human-facing ids (REQ-014, CR-003). Sequential per project rather than
@@ -9,38 +9,40 @@ import type { Tx } from '../db.js';
  * extractions cannot mint the same reference. The unique constraint on
  * (projectId, reference) is the backstop if they somehow do.
  */
+const PREFIXES = {
+  requirement: { table: 'Requirement', prefix: 'REQ' },
+  deliverable: { table: 'Deliverable', prefix: 'DEL' },
+  workItem: { table: 'WorkItem', prefix: 'TSK' },
+  changeRequest: { table: 'ChangeRequest', prefix: 'CR' },
+} as const;
+
+export type ReferenceEntity = keyof typeof PREFIXES;
+
+async function countFor(db: Db, entity: ReferenceEntity, projectId: string): Promise<number> {
+  const { table } = PREFIXES[entity];
+  const row = (await db(table).where({ projectId }).count({ n: '*' }).first()) as
+    | { n: number | string }
+    | undefined;
+  return Number(row?.n ?? 0);
+}
+
 export async function nextReference(
-  tx: Tx,
+  db: Db,
   projectId: string,
-  entity: 'requirement' | 'deliverable' | 'workItem' | 'changeRequest',
+  entity: ReferenceEntity,
 ): Promise<string> {
-  const prefixes = {
-    requirement: 'REQ',
-    deliverable: 'DEL',
-    workItem: 'TSK',
-    changeRequest: 'CR',
-  } as const;
-  const prefix = prefixes[entity];
-
-  const count =
-    entity === 'requirement'
-      ? await tx.requirement.count({ where: { projectId } })
-      : entity === 'deliverable'
-        ? await tx.deliverable.count({ where: { projectId } })
-        : entity === 'workItem'
-          ? await tx.workItem.count({ where: { projectId } })
-          : await tx.changeRequest.count({ where: { projectId } });
-
-  return `${prefix}-${String(count + 1).padStart(3, '0')}`;
+  const count = await countFor(db, entity, projectId);
+  return `${PREFIXES[entity].prefix}-${String(count + 1).padStart(3, '0')}`;
 }
 
 /** Allocates a contiguous block of references in one pass — used by bulk AI extraction. */
 export async function nextReferenceBlock(
-  tx: Tx,
+  db: Db,
   projectId: string,
-  entity: 'requirement',
+  entity: ReferenceEntity,
   count: number,
 ): Promise<string[]> {
-  const existing = await tx.requirement.count({ where: { projectId } });
-  return Array.from({ length: count }, (_, i) => `REQ-${String(existing + i + 1).padStart(3, '0')}`);
+  const existing = await countFor(db, entity, projectId);
+  const { prefix } = PREFIXES[entity];
+  return Array.from({ length: count }, (_, i) => `${prefix}-${String(existing + i + 1).padStart(3, '0')}`);
 }

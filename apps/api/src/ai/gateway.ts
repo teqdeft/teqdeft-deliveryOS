@@ -1,4 +1,4 @@
-import type { AiJobType, AiProvider } from '@prisma/client';
+import type { AiJobType, AiProvider } from '@deliveryos/shared';
 import { anthropicAdapter } from './adapters/anthropic.js';
 import { openaiAdapter } from './adapters/openai.js';
 import { estimateCostUsd, resolvePolicy } from './model-policy.js';

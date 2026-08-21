@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { startAnalysisBody } from '@deliveryos/shared';
-import { prisma } from '../db.js';
+import { db, countRows, toBool, toDecimalString, toJson } from '../db/index.js';
 import { requireUser } from '../lib/auth.js';
 import { parseBody, route } from '../lib/http.js';
 import { requireCapability, requireProjectAccess } from '../lib/rbac.js';
@@ -17,20 +17,38 @@ aiRouter.get(
     const user = requireUser(req);
     const project = await requireProjectAccess(user, req.params.projectId);
 
-    const runs = await prisma.aiRun.findMany({
-      where: { projectId: project.id },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-      include: { triggeredBy: { select: { id: true, name: true, avatarColor: true } } },
-    });
+    const rows = await db('AiRun as r')
+      .select('r.*', 'User.id as by_id', 'User.name as by_name', 'User.avatarColor as by_avatarColor')
+      .join('User', 'User.id', 'r.triggeredById')
+      .where('r.projectId', project.id)
+      .orderBy('r.createdAt', 'desc')
+      .limit(50);
+
+    const runs = (rows as Record<string, unknown>[]).map(({ by_id, by_name, by_avatarColor, ...run }) => ({
+      ...run,
+      costUsd: toDecimalString(run.costUsd),
+      warnings: toJson(run.warnings, [] as string[]),
+      inputSourceIds: toJson(run.inputSourceIds, [] as string[]),
+      triggeredBy: { id: by_id, name: by_name, avatarColor: by_avatarColor },
+    }));
 
     // §13.2 "AI output approval, edit and rejection rate by job type" starts here.
-    const spend = await prisma.aiRun.aggregate({
-      where: { projectId: project.id },
-      _sum: { costUsd: true, inputTokens: true, outputTokens: true },
-    });
+    const totals = (await db('AiRun')
+      .where({ projectId: project.id })
+      .sum({ costUsd: 'costUsd', inputTokens: 'inputTokens', outputTokens: 'outputTokens' })
+      .first()) as { costUsd: string | null; inputTokens: string | null; outputTokens: string | null };
 
-    res.json({ runs, spend: spend._sum, aiAvailable });
+    res.json({
+      runs,
+      // SUM over DECIMAL returns a string; the previous response shape kept
+      // costUsd as a string too, so the client needs no change.
+      spend: {
+        costUsd: toDecimalString(totals?.costUsd),
+        inputTokens: totals?.inputTokens === null ? null : Number(totals.inputTokens),
+        outputTokens: totals?.outputTokens === null ? null : Number(totals.outputTokens),
+      },
+      aiAvailable,
+    });
   }),
 );
 
@@ -47,7 +65,7 @@ aiRouter.post(
         'No AI provider is configured on this server. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, then try again.',
       );
     }
-    if (!project.externalAiEnabled) {
+    if (!toBool(project.externalAiEnabled)) {
       throw gateFailed('External AI processing is switched off for this project.');
     }
     if (body.jobType !== 'REQUIREMENT_EXTRACTION') {
@@ -56,10 +74,11 @@ aiRouter.post(
 
     // One run at a time per project: two concurrent extractions over the same
     // sources produce duplicate drafts and double the bill.
-    const running = await prisma.aiRun.findFirst({
-      where: { projectId: project.id, state: { in: ['QUEUED', 'RUNNING'] } },
-      select: { id: true, createdAt: true },
-    });
+    const running = await db('AiRun')
+      .select('id', 'createdAt')
+      .where({ projectId: project.id })
+      .whereIn('state', ['QUEUED', 'RUNNING'])
+      .first();
     if (running) {
       throw gateFailed('An analysis is already running on this project. Wait for it to finish.', { runId: running.id });
     }

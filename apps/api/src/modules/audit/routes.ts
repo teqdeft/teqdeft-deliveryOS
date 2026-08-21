@@ -1,9 +1,8 @@
 import { Router } from 'express';
-import type { Prisma } from '@prisma/client';
-import { prisma } from '../../db.js';
+import { db, indexBy, paginateQuery, toJson, type AuditEventRow } from '../../db/index.js';
 import { requireUser } from '../../lib/auth.js';
 import { paginate, route } from '../../lib/http.js';
-import { hasPortfolioAccess, projectScope, requireProjectAccess } from '../../lib/rbac.js';
+import { hasPortfolioAccess, requireProjectAccess, visibleProjectIds } from '../../lib/rbac.js';
 
 export const auditRouter = Router();
 
@@ -20,36 +19,50 @@ auditRouter.get(
     const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : undefined;
 
     // Project-scoped reads are allowed to any member (§7 "project activity");
-    // the cross-project firehose needs the audit.read capability.
+    // the cross-project firehose is restricted to portfolio roles.
+    if (projectId) await requireProjectAccess(user, projectId);
+
+    const query = db('AuditEvent');
+
     if (projectId) {
-      await requireProjectAccess(user, projectId);
+      query.where('AuditEvent.projectId', projectId);
     } else if (!hasPortfolioAccess(user)) {
-      const scoped = await prisma.project.findMany({ where: projectScope(user), select: { id: true } });
-      req.query.projectIds = scoped.map((p) => p.id).join(',');
+      // Restrict to projects this caller can see. Done as a subquery rather
+      // than by fetching ids first, so the filter cannot be bypassed by a
+      // large portfolio and stays one round trip.
+      query.whereIn('AuditEvent.projectId', (sub) => visibleProjectIds(user)(sub));
     }
 
-    const where: Prisma.AuditEventWhereInput = {
-      ...(projectId ? { projectId } : {}),
-      ...(!projectId && !hasPortfolioAccess(user)
-        ? { projectId: { in: String(req.query.projectIds ?? '').split(',').filter(Boolean) } }
-        : {}),
-      ...(typeof req.query.action === 'string' ? { action: { startsWith: req.query.action } } : {}),
-      ...(typeof req.query.entityId === 'string' ? { entityId: req.query.entityId } : {}),
-    };
+    if (typeof req.query.action === 'string') {
+      query.where('AuditEvent.action', 'like', `${req.query.action.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+    }
+    if (typeof req.query.entityId === 'string') {
+      query.where('AuditEvent.entityId', req.query.entityId);
+    }
 
-    const [items, total] = await Promise.all([
-      prisma.auditEvent.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * pageSize,
-        take: pageSize,
-        include: {
-          actor: { select: { id: true, name: true, avatarColor: true } },
-          project: { select: { id: true, code: true, name: true } },
-        },
-      }),
-      prisma.auditEvent.count({ where }),
+    const { items: rows, total } = await paginateQuery<AuditEventRow>(
+      query.clone().select('AuditEvent.*').orderBy('AuditEvent.createdAt', 'desc'),
+      page,
+      pageSize,
+    );
+
+    const [actors, projects] = await Promise.all([
+      db('User')
+        .select('id', 'name', 'avatarColor')
+        .whereIn('id', [...new Set(rows.map((r) => r.actorId).filter(Boolean) as string[])]),
+      db('Project')
+        .select('id', 'code', 'name')
+        .whereIn('id', [...new Set(rows.map((r) => r.projectId).filter(Boolean) as string[])]),
     ]);
+    const actorById = indexBy(actors, 'id');
+    const projectById = indexBy(projects, 'id');
+
+    const items = rows.map((row) => ({
+      ...row,
+      detail: toJson(row.detail, {} as Record<string, unknown>),
+      actor: row.actorId ? (actorById.get(row.actorId) ?? null) : null,
+      project: row.projectId ? (projectById.get(row.projectId) ?? null) : null,
+    }));
 
     res.json(paginate(items, total, page, pageSize));
   }),

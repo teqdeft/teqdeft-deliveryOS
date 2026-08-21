@@ -1,5 +1,6 @@
-import type { Prisma, Role } from '@prisma/client';
-import { prisma } from '../db.js';
+import type { Knex } from 'knex';
+import type { Role } from '@deliveryos/shared';
+import { db, firstOrThrow, indexBy } from '../db/index.js';
 import type { AuthUser } from './auth.js';
 import { forbidden, notFound } from './errors.js';
 
@@ -14,20 +15,35 @@ export const hasPortfolioAccess = (user: AuthUser) => PORTFOLIO_ROLES.includes(u
  * authorization on reads, not just writes, and a filter applied in one place
  * cannot be forgotten in another.
  */
-export function projectScope(user: AuthUser): Prisma.ProjectWhereInput {
-  if (hasPortfolioAccess(user)) return {};
-  return {
-    OR: [
-      { projectManagerId: user.id },
-      { technicalLeadId: user.id },
-      { members: { some: { userId: user.id } } },
-    ],
+export function projectScope(user: AuthUser) {
+  return (query: Knex.QueryBuilder): Knex.QueryBuilder => {
+    if (hasPortfolioAccess(user)) return query;
+    return query.where((q) =>
+      q
+        .where('Project.projectManagerId', user.id)
+        .orWhere('Project.technicalLeadId', user.id)
+        .orWhereIn('Project.id', (sub) =>
+          sub.select('projectId').from('ProjectMember').where('userId', user.id),
+        ),
+    );
   };
 }
 
-/** Same filter, expressed for tables that hang off a project. */
-export function nestedProjectScope(user: AuthUser): Prisma.ProjectWhereInput | undefined {
-  return hasPortfolioAccess(user) ? undefined : projectScope(user);
+/**
+ * The same restriction for tables that hang off a project, as a subquery of
+ * visible project ids. Used where the outer query is not on Project itself.
+ */
+export function visibleProjectIds(user: AuthUser) {
+  return (sub: Knex.QueryBuilder): Knex.QueryBuilder => {
+    const q = sub.select('id').from('Project');
+    if (hasPortfolioAccess(user)) return q;
+    return q.where((w) =>
+      w
+        .where('projectManagerId', user.id)
+        .orWhere('technicalLeadId', user.id)
+        .orWhereIn('id', (m) => m.select('projectId').from('ProjectMember').where('userId', user.id)),
+    );
+  };
 }
 
 /**
@@ -37,16 +53,25 @@ export function nestedProjectScope(user: AuthUser): Prisma.ProjectWhereInput | u
  * project exists, which leaks the client roster to anyone who can guess an id.
  */
 export async function requireProjectAccess(user: AuthUser, projectId: string) {
-  const project = await prisma.project.findFirst({
-    where: { id: projectId, ...projectScope(user) },
-    include: {
-      client: { select: { id: true, name: true, confidentiality: true } },
-      projectManager: { select: { id: true, name: true, email: true } },
-      technicalLead: { select: { id: true, name: true, email: true } },
-    },
-  });
-  if (!project) throw notFound('Project');
-  return project;
+  const project = await firstOrThrow(
+    projectScope(user)(db('Project').where('Project.id', projectId)).first(),
+    'Project',
+  );
+
+  const [client, people] = await Promise.all([
+    db('Client').select('id', 'name', 'confidentiality').where({ id: project.clientId }).first(),
+    db('User')
+      .select('id', 'name', 'email', 'avatarColor')
+      .whereIn('id', [project.projectManagerId, project.technicalLeadId].filter(Boolean) as string[]),
+  ]);
+  const byId = indexBy(people, 'id');
+
+  return {
+    ...project,
+    client: client ?? null,
+    projectManager: byId.get(project.projectManagerId) ?? null,
+    technicalLead: project.technicalLeadId ? (byId.get(project.technicalLeadId) ?? null) : null,
+  };
 }
 
 /* ------------------------------------------------------------------ */

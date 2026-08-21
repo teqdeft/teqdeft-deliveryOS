@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import multer from 'multer';
 import { createSourceBody } from '@deliveryos/shared';
-import { prisma } from '../../db.js';
+import { db, transaction, indexBy, insertReturning, newId } from '../../db/index.js';
 import { requireUser } from '../../lib/auth.js';
 import { parseBody, route } from '../../lib/http.js';
 import { requireCapability, requireProjectAccess } from '../../lib/rbac.js';
@@ -26,16 +26,33 @@ sourcesRouter.get(
     const user = requireUser(req);
     const project = await requireProjectAccess(user, req.params.projectId);
 
-    const sources = await prisma.source.findMany({
-      where: { projectId: project.id },
-      // Authority first, then recency within a rank — the same precedence the
-      // conflict resolver applies, so the list reads in decision order.
-      orderBy: [{ authority: 'asc' }, { statedAt: 'desc' }],
-      include: {
-        uploadedBy: { select: { id: true, name: true, avatarColor: true } },
-        _count: { select: { fragments: true } },
-      },
-    });
+    // Authority first, then recency within a rank — the same precedence the
+    // conflict resolver applies, so the list reads in decision order. MySQL
+    // orders an ENUM by its declaration order, which is the precedence order.
+    const rows = await db('Source')
+      .where({ projectId: project.id })
+      .orderBy([{ column: 'authority', order: 'asc' }, { column: 'statedAt', order: 'desc' }]);
+
+    const [uploaders, counts] = await Promise.all([
+      db('User')
+        .select('id', 'name', 'avatarColor')
+        .whereIn('id', [...new Set(rows.map((r) => r.uploadedById))]),
+      db('SourceFragment')
+        .select('sourceId')
+        .count({ n: '*' })
+        .whereIn('sourceId', rows.map((r) => r.id))
+        .groupBy('sourceId'),
+    ]);
+    const byId = indexBy(uploaders, 'id');
+    const fragmentCounts = new Map(
+      (counts as unknown as { sourceId: string; n: number | string }[]).map((c) => [c.sourceId, Number(c.n)]),
+    );
+
+    const sources = rows.map((row) => ({
+      ...row,
+      uploadedBy: byId.get(row.uploadedById) ?? null,
+      _count: { fragments: fragmentCounts.get(row.id) ?? 0 },
+    }));
 
     res.json({ sources });
   }),
@@ -47,16 +64,17 @@ sourcesRouter.get(
     const user = requireUser(req);
     const project = await requireProjectAccess(user, req.params.projectId);
 
-    const source = await prisma.source.findFirst({
-      where: { id: req.params.sourceId, projectId: project.id },
-      include: {
-        uploadedBy: { select: { id: true, name: true, avatarColor: true } },
-        fragments: { orderBy: { ordinal: 'asc' } },
-      },
-    });
-    if (!source) throw notFound('Source');
+    const row = await db('Source')
+      .where({ id: req.params.sourceId, projectId: project.id })
+      .first();
+    if (!row) throw notFound('Source');
 
-    res.json({ source });
+    const [uploadedBy, fragments] = await Promise.all([
+      db('User').select('id', 'name', 'avatarColor').where({ id: row.uploadedById }).first(),
+      db('SourceFragment').where({ sourceId: row.id }).orderBy('ordinal', 'asc'),
+    ]);
+
+    res.json({ source: { ...row, uploadedBy: uploadedBy ?? null, fragments } });
   }),
 );
 
@@ -105,35 +123,38 @@ sourcesRouter.post(
 
     const fragments = supported && text ? extractFragments(text, body.kind) : [];
 
-    const source = await prisma.$transaction(async (tx) => {
-      const created = await tx.source.create({
-        data: {
-          projectId: project.id,
-          title: body.title,
-          kind: body.kind,
-          authority: body.authority,
-          confidentiality: body.confidentiality,
-          statedAt: body.statedAt,
-          notes: body.notes || null,
-          originalFilename: file?.originalname ?? null,
-          mimeType: file?.mimetype ?? (body.inlineText ? 'text/plain' : null),
-          byteSize: stored?.byteSize ?? Buffer.byteLength(text, 'utf8'),
-          storageKey: stored?.storageKey ?? null,
-          checksum: stored?.checksum ?? null,
-          uploadedById: user.id,
-          extractedChars: text.length,
-          processingState: !supported ? 'UNSUPPORTED' : fragments.length > 0 ? 'READY' : 'FAILED',
-          processingError: !supported
-            ? (note ?? 'Unsupported file type')
-            : fragments.length === 0
-              ? 'No citable text could be extracted from this source.'
-              : null,
-        },
+    const source = await transaction(async (tx) => {
+      const created = await insertReturning(tx, 'Source', {
+        id: newId(),
+        projectId: project.id,
+        title: body.title,
+        kind: body.kind,
+        authority: body.authority,
+        confidentiality: body.confidentiality,
+        statedAt: body.statedAt,
+        notes: body.notes || null,
+        originalFilename: file?.originalname ?? null,
+        mimeType: file?.mimetype ?? (body.inlineText ? 'text/plain' : null),
+        byteSize: stored?.byteSize ?? Buffer.byteLength(text, 'utf8'),
+        storageKey: stored?.storageKey ?? null,
+        checksum: stored?.checksum ?? null,
+        uploadedById: user.id,
+        extractedChars: text.length,
+        processingState: !supported ? 'UNSUPPORTED' : fragments.length > 0 ? 'READY' : 'FAILED',
+        processingError: !supported
+          ? (note ?? 'Unsupported file type')
+          : fragments.length === 0
+            ? 'No citable text could be extracted from this source.'
+            : null,
       });
 
       if (fragments.length > 0) {
-        await tx.sourceFragment.createMany({
-          data: fragments.map((f) => ({
+        // One multi-row INSERT, chunked so a very large document cannot exceed
+        // max_allowed_packet.
+        await tx.batchInsert(
+          'SourceFragment',
+          fragments.map((f) => ({
+            id: newId(),
             sourceId: created.id,
             ordinal: f.ordinal,
             locator: f.locator,
@@ -141,7 +162,8 @@ sourcesRouter.post(
             charStart: f.charStart,
             charEnd: f.charEnd,
           })),
-        });
+          200,
+        );
       }
 
       await recordAudit(

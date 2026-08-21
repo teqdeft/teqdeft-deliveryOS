@@ -38,7 +38,7 @@ the later releases build on.
 ## Running it
 
 You need **Node 20 or newer** and either **Docker Desktop** (easiest) or your
-own PostgreSQL on `localhost:5432`.
+own MySQL 8 on `localhost:3306`.
 
 ```bash
 git clone https://github.com/teqdeft/teqdeft-deliveryOS
@@ -48,8 +48,8 @@ npm run dev         # API on :4000, web on :5173
 ```
 
 `setup.sh` is safe to run as many times as you like. It checks your setup,
-starts PostgreSQL in Docker if it can, generates a real signing secret, creates
-the schema, and loads a demo project. If something is missing it tells you
+starts MySQL in Docker if it can, generates a real signing secret, runs the
+migrations, and loads a demo project. If something is missing it tells you
 exactly what to install.
 
 Open <http://localhost:5173> and sign in as any seeded account — the password
@@ -93,7 +93,8 @@ launch date and the product count, so a real run produces real conflicts.
 packages/shared     Domain vocabulary, brand tokens, Zod schemas.
                     Shared by API and web; the schemas double as the
                     AI structured-output contract.
-apps/api            Express + Prisma. Modular by domain.
+apps/api            Express + Knex on MySQL. Modular by domain.
+  src/db            connection, typed row registry, marshalling, migrations
   src/lib           auth, rbac, audit, errors, http
   src/modules       clients, projects, sources, requirements, baselines, audit
   src/ai            gateway, provider adapters, model policy, prompts, jobs
@@ -111,6 +112,9 @@ apps/web            React + Vite + Tailwind. Screens map to blueprint §9 ids.
 | Why a project is red | `apps/api/src/modules/projects/health.ts` |
 | How documents become citable | `apps/api/src/modules/sources/extract.ts` |
 | Brand colours | `packages/shared/src/brand.ts` |
+| The database schema | `apps/api/src/db/migrations/` |
+| Row types and column safety | `apps/api/src/db/tables.ts` |
+| MySQL type conversions | `apps/api/src/db/marshal.ts` |
 
 ---
 
@@ -151,6 +155,31 @@ npm run build
 npm run db:deploy -w @deliveryos/api   # apply migrations
 npm start -w @deliveryos/api           # serve the API
 ```
+
+### Database
+
+MySQL 8 via Knex. The schema lives in `apps/api/src/db/migrations/`, listed
+explicitly in that folder's `index.ts` rather than discovered by scanning —
+so development, tests and the compiled build all run the same migrations.
+**Add every new migration to that array.**
+
+```bash
+npm run db:migrate    # apply outstanding migrations
+npm run db:status     # what has and has not run
+npm run db:rollback   # undo the last batch
+```
+
+Three MySQL details worth knowing before you write a query, each handled in
+`src/db/marshal.ts`:
+
+- **Booleans are `TINYINT(1)`**, so a column comes back as `0`/`1`. `if (row.isActive)`
+  is true for both — use `toBool()`. The typed table registry makes
+  `where({ isActive: true })` a compile error rather than a silent empty result.
+- **`DECIMAL` comes back as a string** so precision survives. `toDecimalString()`
+  renders it the way the API always has; never parse a money column as a float.
+- **The collation is `utf8mb4_0900_ai_ci`**, which is case-insensitive, so `LIKE`
+  matches the way the previous case-insensitive search did. `likeContains()`
+  escapes `%` and `_` so a search for "100%" does not match everything.
 
 `apps/web/dist` is a static bundle — serve it from any CDN or static host with
 `/api` proxied to the API service. `render.yaml` describes a working

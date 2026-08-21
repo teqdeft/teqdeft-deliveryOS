@@ -7,11 +7,10 @@
  * show before any AI key is configured.
  */
 import 'dotenv/config';
-import { PrismaClient, type Prisma } from '@prisma/client';
 import bcrypt from 'bcryptjs';
-import { extractFragments } from '../src/modules/sources/extract.js';
-
-const prisma = new PrismaClient();
+import { db, closeDb, fromBool, fromJson, newId } from './index.js';
+import { extractFragments } from '../modules/sources/extract.js';
+import { logger } from '../lib/logger.js';
 
 const DEMO_PASSWORD = 'DeliveryOS2026!';
 
@@ -117,166 +116,211 @@ Also, please make sure the contact form sends an enquiry to sales@northwindorgan
 Best,
 Meera`;
 
+
 async function main() {
-  console.log('Seeding Teqdeft Delivery OS…');
+  logger.info('Seeding Teqdeft Delivery OS…');
 
   const passwordHash = await bcrypt.hash(DEMO_PASSWORD, 12);
   const users: Record<string, string> = {};
 
   for (const person of PEOPLE) {
-    const user = await prisma.user.upsert({
-      where: { email: person.email },
-      update: {},
-      create: {
-        email: person.email,
-        name: person.name,
-        role: person.role,
-        jobTitle: person.jobTitle,
-        avatarColor: person.color,
-        passwordHash,
-      },
+    const existing = await db('User').select('id').where({ email: person.email }).first();
+    if (existing) {
+      users[person.role] = existing.id;
+      continue;
+    }
+    const id = newId();
+    await db('User').insert({
+      id,
+      email: person.email,
+      name: person.name,
+      role: person.role,
+      jobTitle: person.jobTitle,
+      avatarColor: person.color,
+      passwordHash,
     });
-    users[person.role] = user.id;
+    users[person.role] = id;
   }
-  console.log(`  ${PEOPLE.length} users`);
+  logger.info(`  ${PEOPLE.length} users`);
 
-  const client = await prisma.client.upsert({
-    where: { name: 'Northwind Organics' },
-    update: {},
-    create: {
-      name: 'Northwind Organics',
-      contactName: 'Meera Krishnan',
-      contactEmail: 'meera@northwindorganics.in',
-      confidentiality: 'STANDARD',
-      communicationNotes: 'All client communication goes through Meera. Founder signs off design personally and travels often.',
-    },
+  const clientId = await upsertClient({
+    name: 'Northwind Organics',
+    contactName: 'Meera Krishnan',
+    contactEmail: 'meera@northwindorganics.in',
+    communicationNotes:
+      'All client communication goes through Meera. Founder signs off design personally and travels often.',
+  });
+  const secondClientId = await upsertClient({
+    name: 'Harbourline Logistics',
+    contactName: 'Vikram Desai',
+    contactEmail: 'vikram@harbourline.co',
   });
 
-  const secondClient = await prisma.client.upsert({
-    where: { name: 'Harbourline Logistics' },
-    update: {},
-    create: { name: 'Harbourline Logistics', contactName: 'Vikram Desai', contactEmail: 'vikram@harbourline.co' },
-  });
-
-  const existing = await prisma.project.findUnique({ where: { code: 'NWO-01' } });
-  if (existing) {
-    console.log('  demo project already present — nothing further to seed');
+  const existingProject = await db('Project').select('id').where({ code: 'NWO-01' }).first();
+  if (existingProject) {
+    logger.info('  demo project already present — nothing further to seed');
     return;
   }
 
-  const project = await prisma.project.create({
-    data: {
-      code: 'NWO-01',
-      name: 'Northwind Organics website rebuild',
-      summary: 'Eight-template WordPress marketing site with a presentation-only product catalogue migrated from Shopify.',
-      clientId: client.id,
-      engagementType: 'MARKETING_WEBSITE',
-      stage: 'AI_ANALYSIS',
-      projectManagerId: users.PROJECT_MANAGER!,
-      technicalLeadId: users.CTO!,
-      startDate: daysAgo(40),
-      targetLaunchDate: daysAhead(70),
-      contractValue: 850000,
-      currency: 'INR',
-      intakeChecklist: {
-        PROPOSAL: { done: true, note: `Signed ${iso(daysAgo(44))}`, by: 'Arjun Patel', at: daysAgo(44).toISOString() },
-        DEADLINES: { done: false, note: 'Expo date changed twice — see conflict', by: null, at: null },
-        DESIGNS: { done: false, note: null, by: null, at: null },
-        CONTENT_OWNERSHIP: { done: true, note: 'Client supplies all copy and imagery', by: 'Priya Sharma', at: daysAgo(40).toISOString() },
-        CREDENTIALS: { done: false, note: 'Awaiting Shopify export access', by: null, at: null },
-        CLIENT_DEPENDENCIES: { done: false, note: null, by: null, at: null },
-      } as Prisma.InputJsonValue,
-      members: {
-        create: [
-          { userId: users.PROJECT_MANAGER!, projectRole: 'PROJECT_MANAGER' },
-          { userId: users.CTO!, projectRole: 'CTO' },
-          { userId: users.TEAM_MEMBER!, projectRole: 'TEAM_MEMBER' },
-          { userId: users.QA_ENGINEER!, projectRole: 'QA_ENGINEER' },
-          { userId: users.SALES!, projectRole: 'SALES' },
-        ],
+  const projectId = newId();
+  await db('Project').insert({
+    id: projectId,
+    code: 'NWO-01',
+    name: 'Northwind Organics website rebuild',
+    summary:
+      'Eight-template WordPress marketing site with a presentation-only product catalogue migrated from Shopify.',
+    clientId,
+    engagementType: 'MARKETING_WEBSITE',
+    stage: 'AI_ANALYSIS',
+    projectManagerId: users.PROJECT_MANAGER!,
+    technicalLeadId: users.CTO!,
+    startDate: daysAgo(40),
+    targetLaunchDate: daysAhead(70),
+    contractValue: '850000',
+    currency: 'INR',
+    healthFacts: fromJson([]),
+    intakeChecklist: fromJson({
+      PROPOSAL: { done: true, note: `Signed ${iso(daysAgo(44))}`, by: 'Arjun Patel', at: daysAgo(44).toISOString() },
+      DEADLINES: { done: false, note: 'Expo date changed twice — see conflict', by: null, at: null },
+      DESIGNS: { done: false, note: null, by: null, at: null },
+      CONTENT_OWNERSHIP: {
+        done: true, note: 'Client supplies all copy and imagery',
+        by: 'Priya Sharma', at: daysAgo(40).toISOString(),
       },
-    },
+      CREDENTIALS: { done: false, note: 'Awaiting Shopify export access', by: null, at: null },
+      CLIENT_DEPENDENCIES: { done: false, note: null, by: null, at: null },
+    }),
   });
 
-  await prisma.project.create({
-    data: {
-      code: 'HBL-01',
-      name: 'Harbourline shipment tracking portal',
-      summary: 'Customer-facing portal for live shipment tracking, built against their existing TMS API.',
-      clientId: secondClient.id,
-      engagementType: 'CUSTOM_PORTAL',
-      stage: 'DELIVERY_INTAKE',
-      projectManagerId: users.PROJECT_MANAGER!,
-      technicalLeadId: users.CTO!,
-      targetLaunchDate: daysAhead(140),
-      contractValue: 1450000,
-      currency: 'INR',
-      members: { create: [{ userId: users.PROJECT_MANAGER!, projectRole: 'PROJECT_MANAGER' }] },
-    },
+  await db('ProjectMember').insert(
+    (
+      [
+        [users.PROJECT_MANAGER!, 'PROJECT_MANAGER'],
+        [users.CTO!, 'CTO'],
+        [users.TEAM_MEMBER!, 'TEAM_MEMBER'],
+        [users.QA_ENGINEER!, 'QA_ENGINEER'],
+        [users.SALES!, 'SALES'],
+      ] as const
+    ).map(([userId, projectRole]) => ({ id: newId(), projectId, userId, projectRole })),
+  );
+
+  const secondProjectId = newId();
+  await db('Project').insert({
+    id: secondProjectId,
+    code: 'HBL-01',
+    name: 'Harbourline shipment tracking portal',
+    summary: 'Customer-facing portal for live shipment tracking, built against their existing TMS API.',
+    clientId: secondClientId,
+    engagementType: 'CUSTOM_PORTAL',
+    stage: 'DELIVERY_INTAKE',
+    projectManagerId: users.PROJECT_MANAGER!,
+    technicalLeadId: users.CTO!,
+    targetLaunchDate: daysAhead(140),
+    contractValue: '1450000',
+    currency: 'INR',
+    healthFacts: fromJson([]),
+    intakeChecklist: fromJson({}),
+  });
+  await db('ProjectMember').insert({
+    id: newId(),
+    projectId: secondProjectId,
+    userId: users.PROJECT_MANAGER!,
+    projectRole: 'PROJECT_MANAGER',
   });
 
-  const sources: {
-    title: string;
-    kind: 'PROPOSAL' | 'TRANSCRIPT' | 'EMAIL';
-    authority: 'SIGNED_CONTRACT' | 'CALL_TRANSCRIPT' | 'CLIENT_EMAIL';
-    statedAt: string;
-    text: string;
-    uploader: string;
-  }[] = [
-    { title: 'Signed proposal — Northwind Organics website rebuild', kind: 'PROPOSAL', authority: 'SIGNED_CONTRACT', statedAt: iso(daysAgo(44)), text: PROPOSAL, uploader: 'SALES' },
-    { title: 'Kickoff call with Meera Krishnan', kind: 'TRANSCRIPT', authority: 'CALL_TRANSCRIPT', statedAt: iso(daysAgo(39)), text: TRANSCRIPT, uploader: 'PROJECT_MANAGER' },
-    { title: 'Re: Northwind website — kickoff notes', kind: 'EMAIL', authority: 'CLIENT_EMAIL', statedAt: iso(daysAgo(37)), text: EMAIL, uploader: 'PROJECT_MANAGER' },
+  const sources = [
+    {
+      title: 'Signed proposal — Northwind Organics website rebuild',
+      kind: 'PROPOSAL' as const, authority: 'SIGNED_CONTRACT' as const,
+      statedAt: daysAgo(44), text: PROPOSAL, uploader: 'SALES',
+    },
+    {
+      title: 'Kickoff call with Meera Krishnan',
+      kind: 'TRANSCRIPT' as const, authority: 'CALL_TRANSCRIPT' as const,
+      statedAt: daysAgo(39), text: TRANSCRIPT, uploader: 'PROJECT_MANAGER',
+    },
+    {
+      title: 'Re: Northwind website — kickoff notes',
+      kind: 'EMAIL' as const, authority: 'CLIENT_EMAIL' as const,
+      statedAt: daysAgo(37), text: EMAIL, uploader: 'PROJECT_MANAGER',
+    },
   ];
 
   for (const source of sources) {
     const fragments = extractFragments(source.text, source.kind);
-    await prisma.source.create({
-      data: {
-        projectId: project.id,
-        title: source.title,
-        kind: source.kind,
-        authority: source.authority,
-        statedAt: new Date(source.statedAt),
-        mimeType: 'text/plain',
-        byteSize: Buffer.byteLength(source.text, 'utf8'),
-        extractedChars: source.text.length,
-        processingState: 'READY',
-        uploadedById: users[source.uploader]!,
-        fragments: {
-          create: fragments.map((f) => ({
-            ordinal: f.ordinal,
-            locator: f.locator,
-            text: f.text,
-            charStart: f.charStart,
-            charEnd: f.charEnd,
-          })),
-        },
-      },
+    const sourceId = newId();
+    await db('Source').insert({
+      id: sourceId,
+      projectId,
+      title: source.title,
+      kind: source.kind,
+      authority: source.authority,
+      statedAt: source.statedAt,
+      mimeType: 'text/plain',
+      byteSize: Buffer.byteLength(source.text, 'utf8'),
+      extractedChars: source.text.length,
+      processingState: 'READY',
+      uploadedById: users[source.uploader]!,
     });
-    console.log(`  source "${source.title}" — ${fragments.length} fragments`);
+
+    await db.batchInsert(
+      'SourceFragment',
+      fragments.map((f) => ({
+        id: newId(),
+        sourceId,
+        ordinal: f.ordinal,
+        locator: f.locator,
+        text: f.text,
+        charStart: f.charStart,
+        charEnd: f.charEnd,
+      })),
+      200,
+    );
+    logger.info(`  source "${source.title}" — ${fragments.length} fragments`);
   }
 
-  await prisma.auditEvent.create({
-    data: {
-      projectId: project.id,
-      actorId: users.SALES!,
-      action: 'project.created',
-      entityType: 'Project',
-      entityId: project.id,
-      summary: 'Arjun Patel created NWO-01 — Northwind Organics website rebuild',
-      detail: { seeded: true } as Prisma.InputJsonValue,
-    },
+  await db('AuditEvent').insert({
+    id: newId(),
+    projectId,
+    actorId: users.SALES!,
+    action: 'project.created',
+    entityType: 'Project',
+    entityId: projectId,
+    summary: 'Arjun Patel created NWO-01 — Northwind Organics website rebuild',
+    detail: fromJson({ seeded: true }),
   });
 
-  console.log(`\nDone. Sign in with any of:\n`);
-  for (const person of PEOPLE) console.log(`  ${person.email.padEnd(24)} ${person.role}`);
-  console.log(`\nPassword for every demo account: ${DEMO_PASSWORD}`);
-  console.log(`\nOpen NWO-01 and run the AI analysis to see the studio populate.`);
+  logger.info('');
+  logger.info('Done. Sign in with any of:');
+  for (const person of PEOPLE) logger.info(`  ${person.email.padEnd(24)} ${person.role}`);
+  logger.info('');
+  logger.info(`Password for every demo account: ${DEMO_PASSWORD}`);
+  logger.info('Open NWO-01 and run the AI analysis to see the studio populate.');
+}
+
+async function upsertClient(client: {
+  name: string;
+  contactName?: string;
+  contactEmail?: string;
+  communicationNotes?: string;
+}): Promise<string> {
+  const existing = await db('Client').select('id').where({ name: client.name }).first();
+  if (existing) return existing.id;
+  const id = newId();
+  await db('Client').insert({
+    id,
+    name: client.name,
+    contactName: client.contactName ?? null,
+    contactEmail: client.contactEmail ?? null,
+    communicationNotes: client.communicationNotes ?? null,
+    confidentiality: 'STANDARD',
+  });
+  return id;
 }
 
 main()
   .catch((err) => {
-    console.error(err);
-    process.exit(1);
+    logger.error({ err }, 'Seed failed');
+    process.exitCode = 1;
   })
-  .finally(() => prisma.$disconnect());
+  .finally(closeDb);
