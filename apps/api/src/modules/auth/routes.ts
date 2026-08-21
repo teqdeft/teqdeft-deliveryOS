@@ -10,13 +10,42 @@ import { capabilitiesFor, requireCapability } from '../../lib/rbac.js';
 
 export const authRouter = Router();
 
-/** Slows credential stuffing without locking a whole office out — the office shares an IP. */
+/**
+ * IPv6 hands a single client a /64 to rotate through, so the full address is
+ * useless as a rate-limit key. Collapse to the /64 prefix; IPv4 is used as-is.
+ */
+function normaliseIp(ip: string | undefined): string {
+  if (!ip) return 'unknown';
+  const bare = ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+  if (!bare.includes(':')) return bare;
+  return bare.split(':').slice(0, 4).join(':') + '::/64';
+}
+
+/**
+ * Slows credential stuffing without locking out an office that shares one
+ * public IP. Keying on IP alone means ten people behind one NAT burn a shared
+ * budget, and a few mistyped passwords lock out everyone — so the bucket is
+ * per (IP, email) and only failed attempts count against it.
+ *
+ * In-memory, so it resets on restart and does not span instances. Move it to a
+ * Redis store before running more than one API process.
+ */
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 20,
+  limit: 10,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  message: { error: { code: 'RATE_LIMITED', message: 'Too many sign-in attempts. Try again in a few minutes.' } },
+  skipSuccessfulRequests: true,
+  keyGenerator: (req) => {
+    const email = String((req.body as { email?: unknown })?.email ?? '').toLowerCase().slice(0, 200);
+    return `${normaliseIp(req.ip)}:${email}`;
+  },
+  message: {
+    error: {
+      code: 'RATE_LIMITED',
+      message: 'Too many failed sign-in attempts for this account. Try again in a few minutes.',
+    },
+  },
 });
 
 authRouter.post(

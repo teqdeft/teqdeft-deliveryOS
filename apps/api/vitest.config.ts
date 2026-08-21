@@ -8,6 +8,7 @@ export default defineConfig({
       NODE_ENV: 'test',
       DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/deliveryos_test',
       JWT_SECRET: 'test-secret-that-is-long-enough-for-validation',
+      TEST_DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/deliveryos_test?schema=public',
     },
   },
 });

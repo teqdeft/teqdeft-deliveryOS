@@ -121,6 +121,11 @@ npm test                              # unit tests
 python3 apps/api/scripts/smoke.py     # end-to-end, needs API running + seeded
 ```
 
+`npm test` covers the pure logic plus an integration suite that runs the real
+extraction pipeline against PostgreSQL with the model stubbed — including the
+case that matters most: a fabricated fragment id must not be able to
+manufacture provenance.
+
 The smoke suite drives the real HTTP API and checks the things that must not
 regress: authentication, project scoping, the capability matrix, commercial
 redaction, AI gating with no key configured, both approval gates, the health

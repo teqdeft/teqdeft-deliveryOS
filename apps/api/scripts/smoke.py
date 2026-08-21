@@ -101,6 +101,18 @@ check("health is one of the four states", True, health["health"] in {"GREEN", "A
 check("every health signal carries a readable fact", True,
       bool(health["facts"]) and all(f.get("detail") and f.get("rule") for f in health["facts"]))
 
+section("launch date drives health")
+# A project past its promised launch date must never read as healthy, even
+# when no milestones have been planned out yet.
+call("PATCH", f"/projects/{pid}", pm, {"targetLaunchDate": "2020-01-01"})
+_, overdue = call("GET", f"/projects/{pid}/health", pm)
+check("an overdue launch turns the project red", "RED", overdue["health"])
+check("and says so in plain words", True,
+      any(f["rule"] == "launch.overdue" for f in overdue["facts"]))
+call("PATCH", f"/projects/{pid}", pm, {"targetLaunchDate": "2099-01-01"})
+_, restored = call("GET", f"/projects/{pid}/health", pm)
+check("a distant launch date does not", True, restored["health"] != "RED")
+
 section("audit trail (§4.1)")
 _, audit = call("GET", f"/audit?projectId={pid}", pm)
 actions = [i["action"] for i in audit["items"]]
