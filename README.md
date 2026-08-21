@@ -37,15 +37,20 @@ the later releases build on.
 
 ## Running it
 
-Requires Node 20+ and PostgreSQL 14+.
+You need **Node 20 or newer** and either **Docker Desktop** (easiest) or your
+own PostgreSQL on `localhost:5432`.
 
 ```bash
-git clone <this repo> && cd teqdeft-deliveryOS
-cp .env.example apps/api/.env      # then edit DATABASE_URL and JWT_SECRET
-npm install
-npm run setup                      # migrate + seed demo data
-npm run dev                        # API on :4000, web on :5173
+git clone https://github.com/teqdeft/teqdeft-deliveryOS
+cd teqdeft-deliveryOS
+./setup.sh          # starts the database, installs everything, loads demo data
+npm run dev         # API on :4000, web on :5173
 ```
+
+`setup.sh` is safe to run as many times as you like. It checks your setup,
+starts PostgreSQL in Docker if it can, generates a real signing secret, creates
+the schema, and loads a demo project. If something is missing it tells you
+exactly what to install.
 
 Open <http://localhost:5173> and sign in as any seeded account — the password
 for all of them is `DeliveryOS2026!`:
@@ -62,6 +67,12 @@ for all of them is `DeliveryOS2026!`:
 
 Sign in as the PM and then as the developer to see the access model working:
 the same project shows different data.
+
+### Turning on AI analysis
+
+Open `apps/api/.env`, put your key on the `OPENAI_API_KEY` or
+`ANTHROPIC_API_KEY` line, and restart `npm run dev`. That file is gitignored,
+so the key stays on your machine.
 
 ### Without an AI key
 
